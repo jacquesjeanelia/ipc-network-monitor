@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use aya::{
-    programs::{Xdp, XdpFlags},
+    programs::{tc::qdisc_add_clsact, SchedClassifier, TcAttachType, Xdp, XdpFlags},
     maps::{Array, HashMap}
 };
 use clap::Parser;
@@ -66,7 +66,19 @@ async fn main() -> anyhow::Result<()> {
     program.load()?;
     program.attach(&iface, XdpFlags::SKB_MODE)
         .context("failed to attach the XDP program")?;
-    println!("Monitoring live traffic!Press Ctrl-C to stop.");
+    println!("Attached XDP program to Ingress of {iface}");
+
+    let _ = qdisc_add_clsact(&iface);
+    let tc_program: &mut SchedClassifier = ebpf.program_mut("kernel_spy_tc").unwrap().try_into()?;
+    tc_program.load()?;
+    tc_program.attach(&iface, TcAttachType::Egress)
+        .context("failed to attach the TC program")?;
+    println!("Attached TC program to Egress of {iface}");
+
+    // Get and populate mutable map first before immutable maps
+    let mut blocklist_map: HashMap<_, u32, u8> = HashMap::try_from(ebpf.map_mut("BLOCKLIST_MAP").unwrap())?;
+    blocklist_map.insert(u32::from_ne_bytes([8, 8, 8, 8]), &1, 0)?;
+    println!("FIREWALL: 8.8.8.8 has been added to the blocklist");
 
     let monitor_map: Array<_, u64> = Array::try_from(ebpf.map("MONITOR_MAP").unwrap())?;
     let ip_stats: HashMap<_, PacketMetadata, u64> = HashMap::try_from(ebpf.map("IP_STATS").unwrap())?;
@@ -91,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
                     1 => "ICMP",
                     _ => "Other",
                 };
+                //TODO: print if blocked
                 if src_port == 0 && dst_port == 0 {
                     println!("Source IP: {:<15} | Destination IP: {:<15} | Protocol: {} | Sent: {} bytes", src_ip_address.to_string(), dst_ip_address.to_string(), protocol, bytes);
                 } else {

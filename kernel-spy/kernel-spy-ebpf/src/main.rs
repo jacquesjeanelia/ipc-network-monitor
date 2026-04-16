@@ -3,10 +3,10 @@
 
 use aya_ebpf::{
     bindings::xdp_action, 
-    macros::{xdp, map}, 
+    macros::{classifier, xdp, map}, 
     maps::Array,
     maps::HashMap,
-    programs::XdpContext
+    programs::{TcContext, XdpContext}
 };
 // use aya_log_ebpf::info;
 use network_types::{
@@ -21,50 +21,39 @@ use kernel_spy_common::PacketMetadata;
 static MONITOR_MAP: Array<u64> = Array::with_max_entries(2, 0);
 #[map]
 static IP_STATS: HashMap<PacketMetadata, u64> = HashMap::with_max_entries(1024,0);
+#[map]
+static BLOCKLIST_MAP: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
 
-#[xdp]
-pub fn kernel_spy(ctx: XdpContext) -> u32 {
-    match try_kernel_spy(ctx) {
-        Ok(ret) => ret,
-        Err(_) => xdp_action::XDP_ABORTED,
-    }
-}
 
-fn try_kernel_spy(ctx: XdpContext) -> Result<u32, u32> {
-    let data = ctx.data();
-    let data_end = ctx.data_end();
+#[inline(always)]
+fn process_packet(data: usize, data_end: usize) -> Result<bool, ()> {
     let packet_size = (data_end - data) as u64;
-
-    if let Some(packet_counter) = MONITOR_MAP.get_ptr_mut(0){
-        unsafe{
-            *packet_counter += 1;
-        }
-    }
-
-    if let Some(byte_counter) = MONITOR_MAP.get_ptr_mut(1){
-        unsafe{
-            *byte_counter += packet_size;
-        }
-    }
 
     let eth_hdr: *const EthHdr = data as *const EthHdr;
     if eth_hdr as usize + EthHdr::LEN > data_end{
-        return Ok(xdp_action::XDP_PASS);
+        return Err(());
     }
 
     if unsafe{(*eth_hdr).ether_type} != EtherType::Ipv4 as u16{
-        return Ok(xdp_action::XDP_PASS);
+        return Err(());
     }
 
     let ip_hdr: *const Ipv4Hdr = (data + EthHdr::LEN) as *const Ipv4Hdr;
     if ip_hdr as usize + Ipv4Hdr::LEN > data_end{
-        return Ok(xdp_action::XDP_PASS);
+        return Err(());
     }
 
 
-    let src_ip = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_hdr).src_addr)) };
-    let dst_ip = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_hdr).dst_addr)) };
+    let src_ip = unsafe { u32::from_be_bytes(core::ptr::read_unaligned(core::ptr::addr_of!((*ip_hdr).src_addr))) };
+    let dst_ip = unsafe { u32::from_be_bytes(core::ptr::read_unaligned(core::ptr::addr_of!((*ip_hdr).dst_addr))) };
     let protocol = unsafe { (*ip_hdr).proto } as u8;
+
+    let mut drop_packet = false;
+    if unsafe { BLOCKLIST_MAP.get(&src_ip) }.is_some() || unsafe { BLOCKLIST_MAP.get(&dst_ip) }.is_some() {
+        drop_packet = true;
+    }
+    
+
     let mut src_port: u16 = 0;
     let mut dst_port: u16 = 0;
 
@@ -87,10 +76,22 @@ fn try_kernel_spy(ctx: XdpContext) -> Result<u32, u32> {
         }
     }
 
+    if let Some(packet_counter) = MONITOR_MAP.get_ptr_mut(0){
+        unsafe{
+            *packet_counter += 1;
+        }
+    }
+
+    if let Some(byte_counter) = MONITOR_MAP.get_ptr_mut(1){
+        unsafe{
+            *byte_counter += packet_size;
+        }
+    }
+
 
     let metadata = PacketMetadata::new(
-        u32::from_be_bytes(src_ip),
-        u32::from_be_bytes(dst_ip),
+        src_ip,
+        dst_ip,
         src_port,
         dst_port,
         protocol
@@ -102,10 +103,27 @@ fn try_kernel_spy(ctx: XdpContext) -> Result<u32, u32> {
             *address_count += (data_end - data) as u64;
         }
     }else{
-        IP_STATS.insert(&metadata, &((data_end - data) as u64), 0).map_err(|_|1u32)?;
+            let _ = IP_STATS.insert(&metadata, &((data_end - data) as u64), 0).map_err(|_| ())?;
     }
 
-    Ok(xdp_action::XDP_PASS)
+    Ok(drop_packet)
+}
+
+
+#[xdp]
+pub fn kernel_spy(ctx: XdpContext) -> u32 {
+    match process_packet(ctx.data() as usize, ctx.data_end() as usize) {
+        Ok(true) => xdp_action::XDP_DROP,
+        _ => xdp_action::XDP_PASS,
+    }
+}
+
+#[classifier]
+pub fn kernel_spy_tc(ctx: TcContext) -> i32 {
+    match process_packet(ctx.data() as usize, ctx.data_end() as usize) {
+        Ok(true) => 2, // TC_ACT_SHOT
+        _ => 0, // TC_ACT_OK
+    }
 }
 
 #[cfg(not(test))]
