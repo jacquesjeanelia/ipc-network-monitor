@@ -1,6 +1,6 @@
-//! CLI + optional TOML configuration (single surface for daemon settings).
+//! cli flags plus optional toml — one place for daemon settings
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -13,79 +13,79 @@ use serde::Deserialize;
     about = "IPC network monitor and controller (privileged collector daemon)"
 )]
 pub struct Cli {
-    /// Network interface to attach XDP and TC programs to.
+    /// iface for xdp + tc
     #[arg(short, long, default_value = "eth0")]
     pub iface: String,
 
-    /// Optional TOML config; CLI flags override file values where both exist.
+    /// optional toml; explicit cli wins on overlaps
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// Seconds between snapshots / stdout updates.
+    /// seconds between snapshots / stdout refresh
     #[arg(long, default_value_t = 2)]
     pub interval_secs: u64,
 
-    /// XDP attach mode: skb, drv, hw, generic, or empty (default generic in kernel).
+    /// xdp mode: skb, drv, hw, generic, or empty (kernel default is often generic)
     #[arg(long, default_value = "skb")]
     pub xdp_mode: String,
 
-    /// Unix socket path for JSON export (newline-delimited wrapped snapshots).
+    /// unix path for newline json export
     #[arg(long, default_value = "/tmp/ipc-netmon.sock")]
     pub export_socket: PathBuf,
 
-    /// Unix socket for JSON control RPC (preview/rollback/session dump).
+    /// unix path for json control rpc
     #[arg(long, default_value = "/tmp/ipc-netmon-ctl.sock")]
     pub control_socket: PathBuf,
 
-    /// Disable control RPC socket.
+    /// do not bind the control rpc socket
     #[arg(long, default_value_t = false)]
     pub no_control_socket: bool,
 
-    /// Persistent state (nft rollback backups, etc.).
+    /// on-disk state dir (nft rollback file, etc.)
     #[arg(long, default_value = "/tmp/ipc-netmon-state")]
     pub state_dir: PathBuf,
 
-    /// Snapshots kept in memory for `session_dump` (ring buffer size).
+    /// how many past snapshots to keep for `session_dump`
     #[arg(long, default_value_t = 120)]
     pub session_ring_size: usize,
 
-    /// Alert when RX bytes delta per tick exceeds this (0 = disabled).
+    /// alert if rx byte delta per tick exceeds this (0 = off)
     #[arg(long, default_value_t = 0)]
     pub alert_rx_bytes_per_tick: u64,
 
-    /// Alert when EMA-smoothed RX byte delta exceeds this (0 = disabled).
+    /// alert on ema-smoothed rx delta above this (0 = off)
     #[arg(long, default_value_t = 0)]
     pub alert_rx_ema_delta_threshold: u64,
 
-    /// EMA alpha for RX delta smoothing (only if `--alert-rx-ema-delta-threshold` > 0).
+    /// ema alpha for rx smoothing (only if ema threshold > 0)
     #[arg(long, default_value = "0.25")]
     pub alert_rx_ema_alpha: f64,
 
-    /// Alert when top PID `bytes_total` in aggregates exceeds this (0 = disabled).
+    /// alert when top pid `bytes_total` in aggregates exceeds this (0 = off)
     #[arg(long, default_value_t = 0)]
     pub alert_top_pid_bytes: u64,
 
-    /// Disable Unix socket export (stdout only).
+    /// skip export unix socket (stdout only)
     #[arg(long, default_value_t = false)]
     pub no_export_socket: bool,
 
-    /// Comma-separated IPv4 blocklist (written to eBPF map at startup).
+    /// comma-separated ipv4/ipv6 blocklist — written to ebpf maps at startup
     #[arg(long, value_delimiter = ',')]
-    pub blocklist: Vec<Ipv4Addr>,
+    pub blocklist: Vec<IpAddr>,
 
     /// skip attaching the `tcp:tcp_retransmit_skb` tracepoint
     #[arg(long, default_value_t = false)]
     pub skip_tcp_retransmit_trace: bool,
 
-    /// Maximum flow rows per direction in JSON export.
+    /// max flow rows per direction in json export
     #[arg(long, default_value_t = 256)]
     pub max_flow_rows: usize,
 
-    /// Flow lines to print to the terminal each interval (JSON export still uses `--max-flow-rows`).
+    /// how many flow lines to print each tick (json still capped by `--max-flow-rows`)
     #[arg(long, default_value_t = 25)]
     pub console_flow_lines: usize,
 
-    /// Seed the demo blocklist entry for 8.8.8.8 (unsafe for production).
+    /// add demo 8.8.8.8 blocklist entry (do not use in prod)
     #[arg(long, default_value_t = false)]
     pub seed_demo_blocklist: bool,
 
@@ -101,12 +101,12 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub netem_confirm: bool,
 
-    /// Path for optional append-only audit log (control-plane actions).
+    /// optional append-only audit log for control-plane actions
     #[arg(long)]
     pub audit_log: Option<PathBuf>,
 }
 
-/// TOML keys map 1:1 to these fields; the compiler does not see `Deserialize` as "reads".
+/// toml keys line up with these fields (deserialize is not magic io — we load explicitly)
 #[derive(Debug, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct ConfigFile {
@@ -143,7 +143,7 @@ impl ConfigFile {
     }
 }
 
-/// Effective options after merging TOML over CLI defaults (CLI wins where user passed explicit overrides - we only merge file for unset semantics via field-by-field).
+/// resolved settings: start from cli defaults, overlay toml, then treat explicit cli as authoritative
 pub struct EffectiveConfig {
     pub interval_secs: u64,
     pub export_socket: PathBuf,

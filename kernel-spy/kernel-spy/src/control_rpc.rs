@@ -11,6 +11,7 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::control;
 use crate::nft;
 use crate::session_history::SessionRing;
+use crate::socket_perm;
 
 #[derive(Debug, Deserialize)]
 struct ControlRequest {
@@ -217,6 +218,116 @@ async fn handle_line(
                 Err(e) => respond_err(e.to_string()),
             }
         }
+        "nft_preview_drop_uid" => {
+            let uid_raw = match req.params.get("uid").and_then(|v| v.as_u64()) {
+                Some(u) => u,
+                None => return respond_err("params.uid required"),
+            };
+            let uid: u32 = match u32::try_from(uid_raw) {
+                Ok(u) => u,
+                Err(_) => return respond_err("params.uid: out of range"),
+            };
+            let preview = nft::preview_drop_uid(uid);
+            let _ = control::audit(
+                audit_path.as_deref(),
+                "nft_preview_drop_uid",
+                &format!("uid={uid}"),
+                Some("success"),
+                sid,
+            );
+            respond_ok(json!({ "preview": preview }))
+        }
+        "nft_preview_drop_gid" => {
+            let gid_raw = match req.params.get("gid").and_then(|v| v.as_u64()) {
+                Some(g) => g,
+                None => return respond_err("params.gid required"),
+            };
+            let gid: u32 = match u32::try_from(gid_raw) {
+                Ok(g) => g,
+                Err(_) => return respond_err("params.gid: out of range"),
+            };
+            let preview = nft::preview_drop_gid(gid);
+            let _ = control::audit(
+                audit_path.as_deref(),
+                "nft_preview_drop_gid",
+                &format!("gid={gid}"),
+                Some("success"),
+                sid,
+            );
+            respond_ok(json!({ "preview": preview }))
+        }
+        "nft_apply_drop_uid" => {
+            let uid_raw = match req.params.get("uid").and_then(|v| v.as_u64()) {
+                Some(u) => u,
+                None => return respond_err("params.uid required"),
+            };
+            let uid: u32 = match u32::try_from(uid_raw) {
+                Ok(u) => u,
+                Err(_) => return respond_err("params.uid: out of range"),
+            };
+            let dir = state_dir.clone();
+            let ap = audit_path.clone();
+            let res = tokio::task::spawn_blocking(move || nft::apply_drop_uid(&dir, uid)).await;
+            match res {
+                Ok(Ok(path)) => {
+                    let _ = control::audit(
+                        ap.as_deref(),
+                        "nft_apply_drop_uid",
+                        &format!("uid={uid} backup={}", path.display()),
+                        Some("success"),
+                        sid,
+                    );
+                    respond_ok(json!({ "backup": path.to_string_lossy() }))
+                }
+                Ok(Err(e)) => {
+                    let _ = control::audit(
+                        audit_path.as_deref(),
+                        "nft_apply_drop_uid",
+                        &format!("uid={uid} err={e:#}"),
+                        Some("failure"),
+                        sid,
+                    );
+                    respond_err(e.to_string())
+                }
+                Err(e) => respond_err(e.to_string()),
+            }
+        }
+        "nft_apply_drop_gid" => {
+            let gid_raw = match req.params.get("gid").and_then(|v| v.as_u64()) {
+                Some(g) => g,
+                None => return respond_err("params.gid required"),
+            };
+            let gid: u32 = match u32::try_from(gid_raw) {
+                Ok(g) => g,
+                Err(_) => return respond_err("params.gid: out of range"),
+            };
+            let dir = state_dir.clone();
+            let ap = audit_path.clone();
+            let res = tokio::task::spawn_blocking(move || nft::apply_drop_gid(&dir, gid)).await;
+            match res {
+                Ok(Ok(path)) => {
+                    let _ = control::audit(
+                        ap.as_deref(),
+                        "nft_apply_drop_gid",
+                        &format!("gid={gid} backup={}", path.display()),
+                        Some("success"),
+                        sid,
+                    );
+                    respond_ok(json!({ "backup": path.to_string_lossy() }))
+                }
+                Ok(Err(e)) => {
+                    let _ = control::audit(
+                        audit_path.as_deref(),
+                        "nft_apply_drop_gid",
+                        &format!("gid={gid} err={e:#}"),
+                        Some("failure"),
+                        sid,
+                    );
+                    respond_err(e.to_string())
+                }
+                Err(e) => respond_err(e.to_string()),
+            }
+        }
         "nft_rollback" => {
             let backup = req
                 .params
@@ -309,6 +420,7 @@ pub async fn serve_control_socket(
             return;
         }
     };
+    socket_perm::chmod_0666_for_clients(&path);
     log::info!("Control RPC listening on {}", path.display());
     loop {
         match listener.accept().await {

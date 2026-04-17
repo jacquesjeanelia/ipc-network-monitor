@@ -2,15 +2,15 @@
 
 use common::{AlertEvent, DirectionTotals, ProcessTrafficRow};
 
-/// Alert configuration: set thresholds to 0 to disable each mode.
+/// tweak thresholds; set a field to 0 to turn that alert off
 pub struct AlertConfig {
-    /// Raw RX byte delta per tick (0 = disabled).
+    /// raw rx byte delta per tick (0 = off)
     pub rx_bytes_per_tick_threshold: u64,
-    /// EMA smoothing factor for RX byte deltas (0.0–1.0); used only if `rx_ema_delta_threshold` > 0.
+    /// ema alpha for rx deltas (0..=1); only used when `rx_ema_delta_threshold` > 0
     pub rx_ema_alpha: f64,
-    /// Fire when smoothed RX byte delta exceeds this (0 = EMA alerts disabled).
+    /// fire when smoothed rx byte delta passes this (0 = ema path off)
     pub rx_ema_delta_threshold: u64,
-    /// Fire when the top PID row's `bytes_total` exceeds this (0 = disabled).
+    /// fire when top pid `bytes_total` passes this (0 = off)
     pub top_pid_bytes_threshold: u64,
 }
 

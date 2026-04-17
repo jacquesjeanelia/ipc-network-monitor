@@ -8,11 +8,12 @@ mod netdev;
 mod nft;
 mod proc_corr;
 mod session_history;
+mod socket_perm;
 mod ss_enrich;
 mod tc_control;
 
 use std::borrow::Borrow;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
@@ -26,7 +27,7 @@ use common::{
     DirectionTotals, ExportLine, FlowRow, HealthSnapshot, MonitorSnapshotV1, ProbeStatus,
     SCHEMA_VERSION, SessionInfo,
 };
-use kernel_spy_common::{HealthCounterIndex, PacketMetadata};
+use kernel_spy_common::{HealthCounterIndex, PacketMetadata, PacketMetadataV6};
 use log::{debug, warn};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
@@ -73,12 +74,10 @@ fn read_health<T: Borrow<MapData>>(arr: &Array<T, u64>) -> (u64, u64) {
 fn collect_flow_rows<T: Borrow<MapData>>(
     map: &HashMap<T, PacketMetadata, u64>,
     proc_cache: Option<&proc_corr::InodePidCache>,
-    max_rows: usize,
     want_pid: bool,
 ) -> anyhow::Result<Vec<FlowRow>> {
     let mut rows: Vec<(PacketMetadata, u64)> = map.iter().filter_map(|e| e.ok()).collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1));
-    rows.truncate(max_rows);
 
     let mut out = Vec::with_capacity(rows.len());
     for (meta, bytes) in rows {
@@ -104,7 +103,52 @@ fn collect_flow_rows<T: Borrow<MapData>>(
     Ok(out)
 }
 
+fn collect_flow_rows_v6<T: Borrow<MapData>>(
+    map: &HashMap<T, PacketMetadataV6, u64>,
+    proc_cache: Option<&proc_corr::InodePidCache>,
+    want_pid: bool,
+) -> anyhow::Result<Vec<FlowRow>> {
+    let mut rows: Vec<(PacketMetadataV6, u64)> = map.iter().filter_map(|e| e.ok()).collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (meta, bytes) in rows {
+        let local_pid = if want_pid {
+            let flow = proc_corr::ipv6_flow_from_packet(&meta);
+            proc_cache.and_then(|c| proc_corr::pid_via_proc_socket_v6(&flow, c))
+        } else {
+            None
+        };
+        let src = Ipv6Addr::from(meta.src_ip);
+        let dst = Ipv6Addr::from(meta.dst_ip);
+        out.push(FlowRow {
+            src_ip: src.to_string(),
+            dst_ip: dst.to_string(),
+            src_port: meta.src_port,
+            dst_port: meta.dst_port,
+            protocol: protocol_name(meta.protocol).to_string(),
+            bytes,
+            local_pid,
+            local_uid: None,
+            local_username: None,
+        });
+    }
+    Ok(out)
+}
+
+/// merge ipv4 + ipv6 flow rows, sort by bytes, keep top `max_rows` for export
+fn merge_flow_rows_by_bytes(mut a: Vec<FlowRow>, b: Vec<FlowRow>, max_rows: usize) -> Vec<FlowRow> {
+    a.extend(b);
+    a.sort_by(|x, y| y.bytes.cmp(&x.bytes));
+    a.truncate(max_rows);
+    a
+}
+
 fn count_flow_map_entries<T: Borrow<MapData>>(m: &HashMap<T, PacketMetadata, u64>) -> usize {
+    m.iter().filter_map(|e| e.ok()).count()
+}
+
+fn count_flow_map_entries_v6<T: Borrow<MapData>>(m: &HashMap<T, PacketMetadataV6, u64>) -> usize {
     m.iter().filter_map(|e| e.ok()).count()
 }
 
@@ -232,19 +276,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut blocklist_map = HashMap::try_from(ebpf.map_mut("BLOCKLIST_MAP").unwrap())?;
-    let mut block_ips: Vec<Ipv4Addr> = cli.blocklist.clone();
-    if block_ips.is_empty() {
+    let mut block_ips_v4: Vec<Ipv4Addr> = Vec::new();
+    let mut block_ips_v6: Vec<Ipv6Addr> = Vec::new();
+    for ip in &cli.blocklist {
+        match ip {
+            IpAddr::V4(a) => block_ips_v4.push(*a),
+            IpAddr::V6(a) => block_ips_v6.push(*a),
+        }
+    }
+    if block_ips_v4.is_empty() && block_ips_v6.is_empty() {
         if let Some(ss) = file_cfg.as_ref().and_then(|f| f.blocklist.as_ref()) {
             for s in ss {
-                if let Ok(ip) = s.parse() {
-                    block_ips.push(ip);
+                if let Ok(ip) = s.parse::<IpAddr>() {
+                    match ip {
+                        IpAddr::V4(a) => block_ips_v4.push(a),
+                        IpAddr::V6(a) => block_ips_v6.push(a),
+                    }
                 }
             }
         }
     }
     if seed_demo {
-        block_ips.push("8.8.8.8".parse()?);
+        block_ips_v4.push("8.8.8.8".parse()?);
         control::audit(
             audit_path.as_deref(),
             "demo_blocklist",
@@ -253,12 +306,24 @@ async fn main() -> anyhow::Result<()> {
             Some(session_id.as_str()),
         )?;
     }
-    control::apply_blocklist(
-        &mut blocklist_map,
-        &block_ips,
-        audit_path.as_deref(),
-        Some(session_id.as_str()),
-    )?;
+    {
+        let mut blocklist_map = HashMap::try_from(ebpf.map_mut("BLOCKLIST_MAP").unwrap())?;
+        control::apply_blocklist(
+            &mut blocklist_map,
+            &block_ips_v4,
+            audit_path.as_deref(),
+            Some(session_id.as_str()),
+        )?;
+    }
+    {
+        let mut blocklist6_map = HashMap::try_from(ebpf.map_mut("BLOCKLIST6_MAP").unwrap())?;
+        control::apply_blocklist_v6(
+            &mut blocklist6_map,
+            &block_ips_v6,
+            audit_path.as_deref(),
+            Some(session_id.as_str()),
+        )?;
+    }
 
     // PID correlation: `/proc/net/tcp|udp` + inode → PID (`proc_corr`); optional `--ss-enrich` for ss(8).
 
@@ -312,6 +377,8 @@ async fn main() -> anyhow::Result<()> {
     let monitor_tx = Array::try_from(ebpf.map("MONITOR_TX_MAP").unwrap())?;
     let ip_rx = HashMap::try_from(ebpf.map("IP_STATS_RX").unwrap())?;
     let ip_tx = HashMap::try_from(ebpf.map("IP_STATS_TX").unwrap())?;
+    let ip6_rx = HashMap::try_from(ebpf.map("IP6_STATS_RX").unwrap())?;
+    let ip6_tx = HashMap::try_from(ebpf.map("IP6_STATS_TX").unwrap())?;
     let health = Array::try_from(ebpf.map("HEALTH_COUNTERS").unwrap())?;
 
     let (tx_broadcast, _) = broadcast::channel::<String>(8);
@@ -343,6 +410,7 @@ async fn main() -> anyhow::Result<()> {
                     return;
                 }
             };
+            socket_perm::chmod_0666_for_clients(&path);
             log::info!("Export socket listening on {}", path.display());
             loop {
                 match listener.accept().await {
@@ -425,8 +493,9 @@ async fn main() -> anyhow::Result<()> {
         println!("PID: disabled (--proc-pid-correlation=false)");
     }
     println!(
-        "blocklist: {} IPv4 entries seeded into eBPF",
-        block_ips.len()
+        "blocklist: {} IPv4 + {} IPv6 entries seeded into eBPF maps",
+        block_ips_v4.len(),
+        block_ips_v6.len()
     );
     println!(
         "hint: lines repeat every {}s until traffic changes; Ctrl+C to exit",
@@ -460,18 +529,13 @@ async fn main() -> anyhow::Result<()> {
         }
         let proc_ref = proc_cache.as_ref();
 
-        let mut flows_rx = collect_flow_rows(
-            &ip_rx,
-            proc_ref,
-            eff.max_flow_rows,
-            eff.proc_pid_correlation,
-        )?;
-        let mut flows_tx = collect_flow_rows(
-            &ip_tx,
-            proc_ref,
-            eff.max_flow_rows,
-            eff.proc_pid_correlation,
-        )?;
+        let flows_rx4 = collect_flow_rows(&ip_rx, proc_ref, eff.proc_pid_correlation)?;
+        let flows_rx6 = collect_flow_rows_v6(&ip6_rx, proc_ref, eff.proc_pid_correlation)?;
+        let mut flows_rx = merge_flow_rows_by_bytes(flows_rx4, flows_rx6, eff.max_flow_rows);
+
+        let flows_tx4 = collect_flow_rows(&ip_tx, proc_ref, eff.proc_pid_correlation)?;
+        let flows_tx6 = collect_flow_rows_v6(&ip6_tx, proc_ref, eff.proc_pid_correlation)?;
+        let mut flows_tx = merge_flow_rows_by_bytes(flows_tx4, flows_tx6, eff.max_flow_rows);
 
         attr::enrich_flow_rows(&mut flows_rx);
         attr::enrich_flow_rows(&mut flows_tx);
@@ -521,10 +585,12 @@ async fn main() -> anyhow::Result<()> {
 
         let n_rx_map = count_flow_map_entries(&ip_rx);
         let n_tx_map = count_flow_map_entries(&ip_tx);
+        let n6_rx_map = count_flow_map_entries_v6(&ip6_rx);
+        let n6_tx_map = count_flow_map_entries_v6(&ip6_tx);
         println!("--------------------------------------------------");
         println!(
-            "ts_ms={}  |  map_entries: ip_rx={} ip_tx={}  |  printed_flows: up_to {} lines/dir (json has up_to {})",
-            ts, n_rx_map, n_tx_map, lines, eff.max_flow_rows
+            "ts_ms={}  |  map_entries: ip_rx={} ip_tx={} ip6_rx={} ip6_tx={}  |  printed_flows: up_to {} lines/dir (json has up_to {})",
+            ts, n_rx_map, n_tx_map, n6_rx_map, n6_tx_map, lines, eff.max_flow_rows
         );
         println!(
             "SESSION | id={}  window_start_ms={}",
@@ -636,4 +702,48 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod flow_merge_tests {
+    use super::merge_flow_rows_by_bytes;
+    use common::FlowRow;
+
+    fn row(bytes: u64, tag: &str) -> FlowRow {
+        FlowRow {
+            src_ip: tag.into(),
+            dst_ip: "0.0.0.0".into(),
+            src_port: 0,
+            dst_port: 0,
+            protocol: "TCP".into(),
+            bytes,
+            local_pid: None,
+            local_uid: None,
+            local_username: None,
+        }
+    }
+
+    #[test]
+    fn merge_orders_by_bytes_and_truncates() {
+        let a = vec![row(100, "a"), row(50, "b")];
+        let b = vec![row(200, "c"), row(10, "d")];
+        let out = merge_flow_rows_by_bytes(a, b, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].bytes, 200);
+        assert_eq!(out[1].bytes, 100);
+    }
+}
+
+#[cfg(test)]
+mod v6_key_tests {
+    use std::mem::{align_of, size_of};
+
+    use kernel_spy_common::{BlocklistIpv6Key, PacketMetadataV6};
+
+    #[test]
+    fn packet_metadata_v6_repr_matches_ebpf() {
+        assert_eq!(size_of::<PacketMetadataV6>(), 40);
+        assert!(align_of::<PacketMetadataV6>() <= 8);
+        assert_eq!(size_of::<BlocklistIpv6Key>(), 16);
+    }
 }

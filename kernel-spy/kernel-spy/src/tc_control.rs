@@ -34,7 +34,7 @@ pub fn apply_root_netem_delay_ms(iface: &str, delay_ms: u32) -> anyhow::Result<(
     Ok(())
 }
 
-/// Remove root qdisc netem (restore `pfifo_fast` or default).
+/// tear down root netem (back to pfifo_fast / kernel default)
 pub fn clear_root_qdisc(iface: &str) -> anyhow::Result<()> {
     validate_iface(iface)?;
     let status = Command::new("tc")

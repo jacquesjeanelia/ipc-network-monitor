@@ -28,7 +28,7 @@ fn resolve(pid: u32) -> (Option<u32>, Option<String>) {
     (uid, name)
 }
 
-/// Fill `local_uid` / `local_username` when `local_pid` is set (cached per PID).
+/// fill `local_uid` / `local_username` when we already have `local_pid` (small per-pid cache)
 pub fn enrich_flow_rows(rows: &mut [FlowRow]) {
     let mut cache: HashMap<u32, (Option<u32>, Option<String>)> = HashMap::new();
     for row in rows.iter_mut() {

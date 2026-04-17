@@ -1,6 +1,6 @@
 //! optional `ss`(8) parse pass: fills `local_pid` when `/proc` inode correlation missed a row
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -9,7 +9,7 @@ use log::{debug, warn};
 
 static WARNED_SS_FAIL: AtomicBool = AtomicBool::new(false);
 
-/// One row from `ss -tu -n -H [-p]`.
+/// one parsed row from `ss -tu -n -H [-p]`
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SsRow {
     proto: u8,
@@ -37,6 +37,27 @@ fn parse_ipv4_endpoint(s: &str) -> Option<(String, u16)> {
     let port = port_s.parse::<u16>().ok()?;
     let ip = host.parse::<Ipv4Addr>().ok()?;
     Some((ip.to_string(), port))
+}
+
+/// bracketed ipv6 + port, e.g. `[::1]:443` or `[2001:db8::1]:80`
+fn parse_ipv6_endpoint(s: &str) -> Option<(String, u16)> {
+    let s = s.trim();
+    let closing = s.find(']')?;
+    if !s.starts_with('[') || s.as_bytes().get(closing + 1) != Some(&b':') {
+        return None;
+    }
+    let ip_s = &s[1..closing];
+    let port_s = &s[closing + 2..];
+    if port_s == "*" {
+        return None;
+    }
+    let port = port_s.parse::<u16>().ok()?;
+    let ip: Ipv6Addr = ip_s.parse().ok()?;
+    Some((ip.to_string(), port))
+}
+
+fn parse_endpoint(s: &str) -> Option<(String, u16)> {
+    parse_ipv4_endpoint(s).or_else(|| parse_ipv6_endpoint(s))
 }
 
 fn extract_pids_from_users_field(rest: &str) -> Vec<u32> {
@@ -72,9 +93,9 @@ fn parse_ss_line(line: &str) -> Option<SsRow> {
         "udp" | "udp6" => 17u8,
         _ => return None,
     };
-    let (local_ip, local_port) = parse_ipv4_endpoint(parts[4])?;
+    let (local_ip, local_port) = parse_endpoint(parts[4])?;
     let (remote_ip, remote_port) =
-        parse_ipv4_endpoint(parts[5]).unwrap_or_else(|| ("0.0.0.0".to_string(), 0));
+        parse_endpoint(parts[5]).unwrap_or_else(|| ("0.0.0.0".to_string(), 0));
 
     let pid = users_tail.and_then(|tail| {
         let pids = extract_pids_from_users_field(tail);
@@ -159,7 +180,7 @@ fn run_ss() -> Option<Vec<SsRow>> {
     Some(rows)
 }
 
-/// Merge `ss` snapshot into flows: set `local_pid` only where it was `None` and `ss -p` supplied a PID.
+/// fold ss rows into flows: only fill `local_pid` where it was missing and `-p` gave a pid
 pub fn enrich_flows_from_ss(flows_rx: &mut [FlowRow], flows_tx: &mut [FlowRow]) {
     let Some(ss_rows) = run_ss() else {
         return;
@@ -209,6 +230,18 @@ mod tests {
     #[test]
     fn parse_whitespace_only_is_none() {
         assert!(parse_ss_line("   ").is_none());
+    }
+
+    #[test]
+    fn parse_tcp6_established_bracket_addrs() {
+        let line = "tcp   ESTAB  0   0      [::1]:443          [::1]:55555  users:((\"foo\",pid=99,fd=3))";
+        let r = parse_ss_line(line).unwrap();
+        assert_eq!(r.proto, 6);
+        assert_eq!(r.local_ip, "::1");
+        assert_eq!(r.local_port, 443);
+        assert_eq!(r.remote_ip, "::1");
+        assert_eq!(r.remote_port, 55555);
+        assert_eq!(r.pid, Some(99));
     }
 
     #[test]

@@ -5,15 +5,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::Ipv6Addr;
 
-use kernel_spy_common::PacketMetadata;
+use kernel_spy_common::{PacketMetadata, PacketMetadataV6};
 
 fn parse_proc_hex_quad(s: &str) -> Option<(u32, u16)> {
     let (ip_hex, port_hex) = s.split_once(':')?;
     if ip_hex.len() != 8 || port_hex.len() != 4 {
         return None;
     }
-    // `/proc/net/tcp` and `/proc/net/udp` print the IPv4 word in **little-endian** hex vs
-    // `PacketMetadata` / kernel headers using network-order (BE) `u32` - align with swap.
+    // proc prints the ipv4 word as little-endian hex; packetmetadata / kernel use be — swap
     let ip_raw = u32::from_str_radix(ip_hex, 16).ok()?;
     let ip = ip_raw.swap_bytes();
     let port = u16::from_str_radix(port_hex, 16).ok()?;
@@ -29,9 +28,9 @@ fn quad_matches_flow(local: (u32, u16), remote: (u32, u16), meta: &PacketMetadat
         || (local.0 == d && local.1 == dp && remote.0 == s && remote.1 == sp)
 }
 
-/// UDP in `/proc/net/udp` often lists **unconnected** sockets with `rem` `00000000:0000` even while
-/// packets carry a full 5-tuple (e.g. stub resolver `127.0.0.1:*` → `127.0.0.53:53`). Strict quad
-/// match never succeeds; accept lines where `local` equals either endpoint of the observed flow.
+/// udp lines in `/proc/net/udp` often show unconnected sockets (`rem` all zeros) while packets
+/// still have a full 5-tuple (stub resolver style). strict quad match fails then — accept `local`
+/// matching either flow endpoint.
 fn udp_proc_line_matches_flow(
     local: (u32, u16),
     remote: (u32, u16),
@@ -73,7 +72,7 @@ fn proc_inode_for_ipv4(meta: &PacketMetadata, table_path: &str) -> Option<u64> {
     None
 }
 
-/// Inode column moved as `/proc/net/*` gained trailing fields; `parts.last()` is often `0`, not inode.
+/// inode column index shifted as proc gained extra fields; `parts.last()` is often `0`, not inode
 fn parse_inode_from_proc_fields(parts: &[&str]) -> Option<u64> {
     if parts.len() > 12 {
         if let Ok(v) = parts.get(9)?.parse::<u64>() {
@@ -85,7 +84,7 @@ fn parse_inode_from_proc_fields(parts: &[&str]) -> Option<u64> {
     parts.iter().rev().find_map(|s| s.parse::<u64>().ok())
 }
 
-/// Socket inode for this IPv4 flow as listed in `/proc/net/tcp` or `/proc/net/udp`.
+/// inode for this ipv4 flow in `/proc/net/tcp` or `/proc/net/udp`
 pub fn proc_inode_for_flow(meta: &PacketMetadata) -> Option<u64> {
     match meta.protocol {
         6 => proc_inode_for_ipv4(meta, "/proc/net/tcp"),
@@ -94,7 +93,7 @@ pub fn proc_inode_for_flow(meta: &PacketMetadata) -> Option<u64> {
     }
 }
 
-/// IPv6 5-tuple for `/proc/net/tcp6` / `/proc/net/udp6` correlation (independent of eBPF IPv4 maps).
+/// ipv6 5-tuple for tcp6/udp6 proc correlation (separate from ipv4 ebpf keys)
 #[derive(Clone, Copy, Debug)]
 pub struct Ipv6FlowMeta {
     pub src: Ipv6Addr,
@@ -104,7 +103,18 @@ pub struct Ipv6FlowMeta {
     pub protocol: u8,
 }
 
-/// Parse `XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX:PPPP` fields from `/proc/net/tcp6` / `udp6`.
+/// build [`Ipv6FlowMeta`] from a [`PacketMetadataV6`] map key
+pub fn ipv6_flow_from_packet(meta: &PacketMetadataV6) -> Ipv6FlowMeta {
+    Ipv6FlowMeta {
+        src: Ipv6Addr::from(meta.src_ip),
+        dst: Ipv6Addr::from(meta.dst_ip),
+        src_port: meta.src_port,
+        dst_port: meta.dst_port,
+        protocol: meta.protocol,
+    }
+}
+
+/// parse `XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX:PPPP` fields from tcp6/udp6 proc lines
 fn parse_tcp6_addr_field(s: &str) -> Option<(Ipv6Addr, u16)> {
     let (addr_hex, port_hex) = s.split_once(':')?;
     if addr_hex.len() != 32 || port_hex.len() != 4 {
@@ -156,7 +166,6 @@ fn proc_line_matches_meta_v6(meta: &Ipv6FlowMeta, local: (Ipv6Addr, u16), remote
     }
 }
 
-#[allow(dead_code)] // Used by [`proc_inode_for_flow_v6`] when IPv6 flows are correlated from proc.
 fn proc_inode_for_ipv6(meta: &Ipv6FlowMeta, table_path: &str) -> Option<u64> {
     let data = fs::read_to_string(table_path).ok()?;
     for line in data.lines().skip(1) {
@@ -174,8 +183,7 @@ fn proc_inode_for_ipv6(meta: &Ipv6FlowMeta, table_path: &str) -> Option<u64> {
     None
 }
 
-/// Socket inode for an IPv6 flow (`tcp6` / `udp6` proc files).
-#[allow(dead_code)]
+/// inode for an ipv6 flow from tcp6/udp6 proc files
 pub fn proc_inode_for_flow_v6(meta: &Ipv6FlowMeta) -> Option<u64> {
     match meta.protocol {
         6 => proc_inode_for_ipv6(meta, "/proc/net/tcp6"),
@@ -184,20 +192,19 @@ pub fn proc_inode_for_flow_v6(meta: &Ipv6FlowMeta) -> Option<u64> {
     }
 }
 
-/// Resolve PID for an IPv6 flow using the inode cache.
-#[allow(dead_code)]
+/// pid for an ipv6 flow via inode cache lookup
 pub fn pid_via_proc_socket_v6(meta: &Ipv6FlowMeta, cache: &InodePidCache) -> Option<u32> {
     let inode = proc_inode_for_flow_v6(meta)?;
     cache.pid_for_inode(inode)
 }
 
-/// Built once per monitoring tick: inode -> owning PID (directory name under `/proc`).
+/// built each tick: inode -> owning pid (from `/proc/<pid>` dirs and fd symlinks)
 pub struct InodePidCache {
     inode_to_pid: HashMap<u64, u32>,
 }
 
 impl InodePidCache {
-    /// One walk of `/proc/*/fd`: map `socket:[inode]` -> PID. Typical cost: tens of ms on a desktop.
+    /// one `/proc/*/fd` walk: map `socket:[inode]` -> pid (can be tens of ms on a busy desktop)
     pub fn refresh() -> Self {
         let mut inode_to_pid = HashMap::new();
         let Ok(proc_dir) = fs::read_dir("/proc") else {
@@ -247,7 +254,7 @@ impl InodePidCache {
     }
 }
 
-/// Resolve PID from `/proc/net/*` quad + inode cache (TCP and UDP).
+/// pid from proc net quad + inode cache (tcp and udp)
 pub fn pid_via_proc_socket(meta: &PacketMetadata, cache: &InodePidCache) -> Option<u32> {
     let inode = proc_inode_for_flow(meta)?;
     cache.pid_for_inode(inode)
@@ -255,7 +262,7 @@ pub fn pid_via_proc_socket(meta: &PacketMetadata, cache: &InodePidCache) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use kernel_spy_common::PacketMetadata;
+    use kernel_spy_common::{PacketMetadata, PacketMetadataV6};
 
     use super::*;
 
@@ -307,6 +314,19 @@ mod tests {
             addr_hex.push_str(&format!("{:08x}", word));
         }
         format!("{addr_hex}:{port:04x}")
+    }
+
+    #[test]
+    fn ipv6_flow_from_packet_meta() {
+        let src = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let pm = PacketMetadataV6::new(src, dst, 443, 80, 6);
+        let f = ipv6_flow_from_packet(&pm);
+        assert_eq!(f.src, Ipv6Addr::from(src));
+        assert_eq!(f.dst, Ipv6Addr::from(dst));
+        assert_eq!(f.src_port, 443);
+        assert_eq!(f.dst_port, 80);
+        assert_eq!(f.protocol, 6);
     }
 
     #[test]

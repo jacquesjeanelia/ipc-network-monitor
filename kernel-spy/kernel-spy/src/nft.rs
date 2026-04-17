@@ -25,7 +25,7 @@ pub fn nft_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Ensure `inet ipc_netmon` exists with a single output hook chain (policy accept).
+/// make sure `inet ipc_netmon` exists with one output hook chain (default accept)
 pub fn ensure_table() -> anyhow::Result<()> {
     let check = nft_cmd()
         .args(["list", "table", TABLE_FAMILY, TABLE_NAME])
@@ -82,7 +82,7 @@ pub fn preview_rate_limit_ipv4(dst: Ipv4Addr, rate: &str) -> anyhow::Result<Stri
     ))
 }
 
-/// Allowed characters for `limit rate` clause (conservative; avoids shell injection in control RPC).
+/// conservative charset check for `limit rate` strings (control rpc passes these to nft)
 pub fn validate_rate_spec(rate: &str) -> anyhow::Result<()> {
     let rate = rate.trim();
     if rate.is_empty() {
@@ -136,7 +136,7 @@ pub fn backup_table(state_dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-/// `nft -c` dry-run for a full `add rule …` argv tail (after `nft -c add rule`).
+/// `nft -c` dry-run: argv tail is everything after `nft -c add rule`
 pub fn dry_run_add_rule(rule_args: &[&str]) -> anyhow::Result<()> {
     let st = nft_cmd()
         .arg("-c")
@@ -151,7 +151,7 @@ pub fn dry_run_add_rule(rule_args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Apply IPv4 drop on local output (backs up table first, dry-run, then apply).
+/// add ipv4 daddr drop on local output — backup, dry-run, then real add
 pub fn apply_drop_ipv4(state_dir: &Path, dst: Ipv4Addr) -> anyhow::Result<PathBuf> {
     ensure_table()?;
     let backup = backup_table(state_dir)?;
@@ -178,7 +178,77 @@ pub fn apply_drop_ipv4(state_dir: &Path, dst: Ipv4Addr) -> anyhow::Result<PathBu
     Ok(backup)
 }
 
-/// Apply rate-limited drop on local output.
+/// preview `meta skuid … drop` on the output hook
+pub fn preview_drop_uid(uid: u32) -> String {
+    format!(
+        "nft add rule {} {} {} meta skuid {} drop",
+        TABLE_FAMILY, TABLE_NAME, CHAIN_OUT, uid
+    )
+}
+
+/// preview `meta skgid … drop` on the output hook
+pub fn preview_drop_gid(gid: u32) -> String {
+    format!(
+        "nft add rule {} {} {} meta skgid {} drop",
+        TABLE_FAMILY, TABLE_NAME, CHAIN_OUT, gid
+    )
+}
+
+/// apply uid drop on local output (same argv shape as [`preview_drop_uid`])
+pub fn apply_drop_uid(state_dir: &Path, uid: u32) -> anyhow::Result<PathBuf> {
+    ensure_table()?;
+    let backup = backup_table(state_dir)?;
+    let uid_s = uid.to_string();
+    let rule_args = [
+        TABLE_FAMILY,
+        TABLE_NAME,
+        CHAIN_OUT,
+        "meta",
+        "skuid",
+        uid_s.as_str(),
+        "drop",
+    ];
+    dry_run_add_rule(&rule_args)?;
+    let st = nft_cmd()
+        .arg("add")
+        .arg("rule")
+        .args(&rule_args)
+        .status()
+        .context("nft add uid rule")?;
+    if !st.success() {
+        anyhow::bail!("nft add uid rule failed (exit {:?})", st.code());
+    }
+    Ok(backup)
+}
+
+/// apply gid drop on local output (same argv shape as [`preview_drop_gid`])
+pub fn apply_drop_gid(state_dir: &Path, gid: u32) -> anyhow::Result<PathBuf> {
+    ensure_table()?;
+    let backup = backup_table(state_dir)?;
+    let gid_s = gid.to_string();
+    let rule_args = [
+        TABLE_FAMILY,
+        TABLE_NAME,
+        CHAIN_OUT,
+        "meta",
+        "skgid",
+        gid_s.as_str(),
+        "drop",
+    ];
+    dry_run_add_rule(&rule_args)?;
+    let st = nft_cmd()
+        .arg("add")
+        .arg("rule")
+        .args(&rule_args)
+        .status()
+        .context("nft add gid rule")?;
+    if !st.success() {
+        anyhow::bail!("nft add gid rule failed (exit {:?})", st.code());
+    }
+    Ok(backup)
+}
+
+/// apply ipv4 daddr rate-limited drop on local output
 pub fn apply_rate_limit_ipv4(state_dir: &Path, dst: Ipv4Addr, rate: &str) -> anyhow::Result<PathBuf> {
     validate_rate_spec(rate)?;
     ensure_table()?;
@@ -211,7 +281,7 @@ pub fn apply_rate_limit_ipv4(state_dir: &Path, dst: Ipv4Addr, rate: &str) -> any
     Ok(backup)
 }
 
-/// Restore ruleset from a file saved by [`backup_table`] (`nft -f`).
+/// load ruleset from a file written by [`backup_table`] (`nft -f`)
 pub fn rollback_from_file(backup: &Path) -> anyhow::Result<()> {
     if !backup.exists() {
         anyhow::bail!("rollback: backup missing at {}", backup.display());
@@ -227,7 +297,7 @@ pub fn rollback_from_file(backup: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Best-effort: flush custom rules in the chain (leaves hook chain in place).
+/// best-effort flush of user rules in the chain; hook definition stays
 #[allow(dead_code)]
 pub fn flush_output_chain() -> anyhow::Result<()> {
     let _ = nft_cmd()
@@ -257,5 +327,19 @@ mod tests {
             .unwrap();
         assert!(p.contains("limit"));
         assert!(p.contains("203.0.113.1"));
+    }
+
+    #[test]
+    fn preview_uid_rule_string() {
+        let p = preview_drop_uid(1000);
+        assert!(p.contains("meta skuid 1000"));
+        assert!(p.contains("drop"));
+    }
+
+    #[test]
+    fn preview_gid_rule_string() {
+        let p = preview_drop_gid(1001);
+        assert!(p.contains("meta skgid 1001"));
+        assert!(p.contains("drop"));
     }
 }

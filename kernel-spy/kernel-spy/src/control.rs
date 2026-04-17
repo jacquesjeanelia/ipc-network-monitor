@@ -3,12 +3,13 @@
 use std::borrow::BorrowMut;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use anyhow::Context;
 use aya::maps::{HashMap, MapData};
 use common::ControlAuditEntry;
+use kernel_spy_common::BlocklistIpv6Key;
 
 /// write ipv4 blocklist into ebpf `BLOCKLIST_MAP` (replaces prior keys — clear map first if you care)
 pub fn apply_blocklist<T: BorrowMut<MapData>>(
@@ -25,6 +26,35 @@ pub fn apply_blocklist<T: BorrowMut<MapData>>(
             audit_path,
             "blocklist_add",
             &format!("ipv4={ip} map_key=0x{k:08x}"),
+            Some("success"),
+            session_id,
+        )?;
+    }
+    Ok(())
+}
+
+/// write ipv6 blocklist into ebpf `BLOCKLIST6_MAP` (same replace semantics as ipv4)
+pub fn apply_blocklist_v6<T: BorrowMut<MapData>>(
+    map: &mut HashMap<T, BlocklistIpv6Key, u8>,
+    ips: &[Ipv6Addr],
+    audit_path: Option<&Path>,
+    session_id: Option<&str>,
+) -> anyhow::Result<()> {
+    for ip in ips {
+        let k = BlocklistIpv6Key {
+            addr: ip.octets(),
+        };
+        map.insert(k, &1, 0)
+            .with_context(|| format!("blocklist6 insert {ip}"))?;
+        let key_hex: String = k
+            .addr
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        audit(
+            audit_path,
+            "blocklist6_add",
+            &format!("ipv6={ip} map_key_hex={key_hex}"),
             Some("success"),
             session_id,
         )?;
