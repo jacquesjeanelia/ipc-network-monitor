@@ -1,10 +1,10 @@
-//! Shared JSON schema for the IPC network monitor (userspace).
+//! shared json types for the ipc network monitor (userspace)
 
 use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// Legacy sample shape (kept for compatibility with older clients).
+/// legacy sample shape (older clients still send this)
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TrafficData {
     pub process_name: String,
@@ -25,9 +25,9 @@ pub struct FlowRow {
     pub dst_port: u16,
     pub protocol: String,
     pub bytes: u64,
-    /// Best-effort local TGID: `/proc` inode correlation (`proc_corr`), optional `ss` when `--ss-enrich`.
+    /// best-effort local tgid: `/proc` inode correlation (`proc_corr`), optional `ss` when `--ss-enrich`
     pub local_pid: Option<u32>,
-    /// Owning user when `local_pid` is known (`None` = unknown per FR-C3)
+    /// owning user when `local_pid` is known; `None` if we could not resolve it
     #[serde(default)]
     pub local_uid: Option<u32>,
     #[serde(default)]
@@ -42,18 +42,18 @@ pub struct HealthSnapshot {
     pub netdev_tx_dropped: Option<u64>,
 }
 
-/// Which probes/components attached successfully (NFR-R1 degraded mode reporting).
+/// which probes/components attached; use this to see degraded mode (partial attach)
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ProbeStatus {
     pub xdp_attached: bool,
     pub tc_egress_attached: bool,
     pub tcp_retransmit_trace_attached: bool,
-    /// Always `false` in current builds (cgroup BPF PID path removed; use `proc` + optional `ss`).
+    /// always `false` now — cgroup bpf pid hook path is gone; use proc + optional `ss`
     pub cgroup_pid_hooks_attached: bool,
-    /// nftables dedicated table present and usable.
+    /// dedicated nft table is present and usable
     #[serde(default)]
     pub nftables_ready: bool,
-    /// Human-readable attach failures (empty if none).
+    /// attach error strings (empty if clean)
     #[serde(default)]
     pub errors: Vec<String>,
 }
