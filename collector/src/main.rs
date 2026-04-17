@@ -1,26 +1,39 @@
-use common::TrafficData;
-use std::io::Write;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::thread;
-use std::time::Duration;
+//! Reads newline-delimited [`MonitorSnapshotV1`] JSON from `kernel-spy` (Unix socket).
 
-fn main(){
-    let _ = std::fs::remove_file("/tmp/netmon.sock"); // Remove the socket file if it already exists to avoid binding errors
-    let listener = UnixListener::bind("/tmp/netmon.sock").unwrap();
+use std::env;
+use std::io::{BufRead, BufReader};
+use std::os::unix::net::UnixStream;
 
-    for stream in listener.incoming(){
-        let mut connection: UnixStream = stream.unwrap(); // Accept a connection
-        loop{
-            let fake_data = TrafficData{ // Create a fake TrafficData instance to send to the UI
-                process_name: String::from("example_process"),
-                bytes_downloaded: 1024,
-            };
+use anyhow::Context;
+use common::MonitorSnapshotV1;
 
-            let mut json_string = serde_json::to_string(&fake_data).unwrap(); // Serialize the TrafficData instance to a JSON string
-            json_string.push('\n');
-
-            connection.write_all(json_string.as_bytes()).unwrap(); // Write the JSON string to the UnixStream, sending it to the UI
-            thread::sleep(Duration::from_secs(1));
+fn main() -> anyhow::Result<()> {
+    let path = env::var("NETMON_SOCKET").unwrap_or_else(|_| "/tmp/ipc-netmon.sock".into());
+    let stream = UnixStream::connect(&path)
+        .with_context(|| format!("connect to {path} (is kernel-spy running?)"))?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
         }
+        let snap: MonitorSnapshotV1 = serde_json::from_str(line.trim())
+            .with_context(|| format!("parse snapshot: {}", line.trim_start().chars().take(120).collect::<String>()))?;
+        println!(
+            "[v{}] iface={} rx={} pkts / {} bytes | tx={} pkts / {} bytes | health tcp_retrans={} policy_drops={} netdev_rx_drop={:?} netdev_tx_drop={:?}",
+            snap.schema_version,
+            snap.iface,
+            snap.rx.packets,
+            snap.rx.bytes,
+            snap.tx.packets,
+            snap.tx.bytes,
+            snap.health.tcp_retransmit_skb,
+            snap.health.policy_drops,
+            snap.health.netdev_rx_dropped,
+            snap.health.netdev_tx_dropped,
+        );
     }
+    Ok(())
 }
