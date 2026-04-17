@@ -1,8 +1,6 @@
 #![no_std]
 #![no_main]
 
-mod pid_track;
-
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{classifier, map, tracepoint, xdp},
@@ -18,7 +16,7 @@ use network_types::{
     udp::UdpHdr,
 };
 
-/// TC classifier return values (see `linux/pkt_cls.h`).
+/// tc classifier return values — same as `linux/pkt_cls.h`
 const TC_ACT_OK: i32 = 0;
 const TC_ACT_SHOT: i32 = 2;
 
@@ -36,12 +34,7 @@ static IP_STATS_TX: HashMap<PacketMetadata, u64> =
 static BLOCKLIST_MAP: HashMap<u32, u8> =
     HashMap::with_max_entries(FlowMapCapacity::MAX_ENTRIES, 0);
 
-/// TGID for a flow key (both directions inserted in `pid_track`). Userspace joins with flow stats.
-#[map]
-pub static PID_BY_FLOW: HashMap<PacketMetadata, u32> =
-    HashMap::with_max_entries(FlowMapCapacity::MAX_ENTRIES, 0);
-
-/// Aggregated health counters (aligned with [`HealthCounterIndex`]).
+/// health counters; indices match [`HealthCounterIndex`] in userspace
 #[map]
 static HEALTH_COUNTERS: Array<u64> = Array::with_max_entries(8, 0);
 
@@ -193,7 +186,7 @@ pub fn kernel_spy_tc(ctx: TcContext) -> i32 {
     }
 }
 
-/// Kernel tracepoint `tcp:tcp_retransmit_skb`.
+/// `tcp:tcp_retransmit_skb` tracepoint — bumps retransmit counter
 #[tracepoint(category = "tcp", name = "tcp_retransmit_skb")]
 pub fn tcp_tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
     let _ = ctx;

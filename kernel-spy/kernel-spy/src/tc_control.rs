@@ -1,4 +1,4 @@
-//! Traffic-control helpers (fault injection / shaping) via `tc` — requires `CAP_NET_ADMIN`.
+//! traffic-control helpers (netem shaping) via `tc`; needs `CAP_NET_ADMIN`
 
 use std::process::Command;
 
@@ -15,7 +15,7 @@ fn validate_iface(iface: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Apply `netem` delay on the **root** qdisc (replaces existing root). Suitable for labs only.
+/// apply netem delay on the root qdisc (replaces existing root); labs only
 pub fn apply_root_netem_delay_ms(iface: &str, delay_ms: u32) -> anyhow::Result<()> {
     validate_iface(iface)?;
     if delay_ms > 60_000 {
@@ -24,14 +24,7 @@ pub fn apply_root_netem_delay_ms(iface: &str, delay_ms: u32) -> anyhow::Result<(
     let delay = format!("{delay_ms}ms");
     let status = Command::new("tc")
         .args([
-            "qdisc",
-            "replace",
-            "dev",
-            iface,
-            "root",
-            "netem",
-            "delay",
-            &delay,
+            "qdisc", "replace", "dev", iface, "root", "netem", "delay", &delay,
         ])
         .status()
         .context("spawn tc")?;

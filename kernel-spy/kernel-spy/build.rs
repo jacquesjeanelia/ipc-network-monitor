@@ -253,9 +253,8 @@ fn build_ebpf_manifest(
 
     for (name, binary) in executables {
         let dst = out_dir.join(name);
-        let _: u64 = fs::copy(&binary, &dst).with_context(|| {
-            format!("failed to copy {} to {}", binary.display(), dst.display())
-        })?;
+        let _: u64 = fs::copy(&binary, &dst)
+            .with_context(|| format!("failed to copy {} to {}", binary.display(), dst.display()))?;
     }
 
     Ok(())
