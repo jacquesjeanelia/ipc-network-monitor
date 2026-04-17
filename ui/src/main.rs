@@ -1,11 +1,9 @@
-//! Human-readable view of [`MonitorSnapshotV1`] from the `kernel-spy` export socket.
-
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 
 use anyhow::Context;
-use common::MonitorSnapshotV1;
+use common::{MonitorSnapshotV1, parse_export_line};
 
 fn main() -> anyhow::Result<()> {
     let path = env::var("NETMON_SOCKET").unwrap_or_else(|_| "/tmp/ipc-netmon.sock".into());
@@ -20,18 +18,15 @@ fn main() -> anyhow::Result<()> {
             break;
         }
         let snap: MonitorSnapshotV1 =
-            serde_json::from_str(line.trim()).context("parse MonitorSnapshotV1 JSON")?;
+            parse_export_line(line.trim()).context("parse MonitorSnapshotV1 JSON")?;
 
-        println!("=== IPC network monitor snapshot (schema {}) ===", snap.schema_version);
+        println!(
+            "=== IPC network monitor snapshot (schema {}) ===",
+            snap.schema_version
+        );
         println!("iface={}  ts_ms={}", snap.iface, snap.ts_unix_ms);
-        println!(
-            "RX  packets={}  bytes={}",
-            snap.rx.packets, snap.rx.bytes
-        );
-        println!(
-            "TX  packets={}  bytes={}",
-            snap.tx.packets, snap.tx.bytes
-        );
+        println!("RX  packets={}  bytes={}", snap.rx.packets, snap.rx.bytes);
+        println!("TX  packets={}  bytes={}", snap.tx.packets, snap.tx.bytes);
         println!(
             "Health  tcp_retransmit_skb={}  policy_drops={}  netdev_rx_dropped={:?}  netdev_tx_dropped={:?}",
             snap.health.tcp_retransmit_skb,
