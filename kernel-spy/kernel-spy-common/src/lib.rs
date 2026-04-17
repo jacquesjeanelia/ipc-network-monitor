@@ -1,5 +1,12 @@
 #![no_std]
 
+/// Max entries for per-flow `HashMap`s in eBPF (must match `kernel-spy-ebpf`).
+pub struct FlowMapCapacity;
+
+impl FlowMapCapacity {
+    pub const MAX_ENTRIES: u32 = 4096;
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct PacketMetadata {
@@ -21,6 +28,20 @@ impl PacketMetadata {
             protocol,
             _pad: [0; 3],
         }
+    }
+}
+
+/// Indices into `HEALTH_COUNTERS` (eBPF `Array<u64>`), mirrored in userspace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum HealthCounterIndex {
+    TcpRetransmitSkb = 0,
+    PolicyDrop = 1,
+}
+
+impl HealthCounterIndex {
+    pub const fn idx(self) -> u32 {
+        self as u32
     }
 }
 

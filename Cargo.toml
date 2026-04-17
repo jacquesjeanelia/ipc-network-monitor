@@ -1,3 +1,46 @@
 [workspace]
-members = ["collector", "ui", "common"]
 resolver = "2"
+exclude = ["kernel-spy/kernel-spy-ebpf"]
+members = [
+    "common",
+    "collector",
+    "ui",
+    "kernel-spy/kernel-spy",
+    "kernel-spy/kernel-spy-common",
+]
+# `kernel-spy-ebpf` is listed in `exclude` (not `members`) so it is not built for the host.
+# `kernel-spy/build.rs` compiles it with `cargo build --manifest-path ...` for `bpfel-unknown-none`.
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
+edition = "2024"
+
+[workspace.dependencies]
+aya = { git = "https://github.com/aya-rs/aya", default-features = false }
+aya-build = { git = "https://github.com/aya-rs/aya", default-features = false }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
+aya-log = { git = "https://github.com/aya-rs/aya", default-features = false }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
+
+anyhow = { version = "1", default-features = true }
+cargo_metadata = { version = "0.23.0", default-features = false }
+clap = { version = "4.5.20", default-features = false, features = ["std", "derive", "help"] }
+env_logger = { version = "0.11.5", default-features = false }
+libc = { version = "0.2.159", default-features = false }
+log = { version = "0.4.22", default-features = false }
+serde = { version = "1.0", default-features = true, features = ["derive"] }
+serde_json = { version = "1.0", default-features = true }
+rustc_version = { version = "0.4.1", default-features = false }
+tokio = { version = "1.52.0", features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "time",
+    "io-util",
+    "fs",
+    "sync",
+] }
+toml = { version = "0.8", default-features = true }
+which = { version = "6.0.0", default-features = false }

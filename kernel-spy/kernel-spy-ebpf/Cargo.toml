@@ -1,18 +1,19 @@
 [package]
 name = "kernel-spy-ebpf"
 version = "0.1.0"
-edition.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
 
 [dependencies]
 kernel-spy-common = { path = "../kernel-spy-common" }
-
-aya-ebpf = { workspace = true }
-aya-log-ebpf = { workspace = true }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
 network-types = "0.1.0"
 
 [build-dependencies]
-which = { workspace = true }
+which = "6.0.0"
 
 [[bin]]
-name = "kernel-spy"
+name = "kernel-spy-ebpf"
 path = "src/main.rs"
