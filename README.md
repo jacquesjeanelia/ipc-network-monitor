@@ -56,13 +56,17 @@ For production, prefer sockets under `/run/...` with **`0660`** and a dedicated 
 
 ## Workspace layout
 
-| Crate | Role |
-|-------|------|
-| `kernel-spy` | Privileged collector: XDP/TC + tracepoint, JSON export + control RPC |
-| `kernel-spy-ebpf` | eBPF programs (maps, classifiers, tracepoints) |
+| Crate               | Role                                                                                                                                    |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `kernel-spy`        | Privileged collector: XDP/TC + tracepoint, JSON export + control RPC                                                                    |
+| `kernel-spy-ebpf`   | eBPF programs (maps, classifiers, tracepoints)                                                                                          |
 | `kernel-spy-common` | Shared `PacketMetadata` / `PacketMetadataV6`, blocklist key types, per-map entry budgets (`FlowMapCapacity`) — no_std + user `aya::Pod` |
-| `common` | Versioned JSON schema (`MonitorSnapshotV1`, `ExportLine`, `parse_export_line`) |
-| `collector` / `ui` | Unix-socket clients consuming export JSON |
+| `common`            | Versioned JSON schema (`MonitorSnapshotV1`, `ExportLine`, `parse_export_line`)                                                          |
+| `collector` / `ui`  | Unix-socket clients consuming export JSON                                                                                               |
+
+## UML artifacts
+
+PlantUML diagrams are available under [docs/uml](docs/uml) and cover the component view, the snapshot export sequence, and the shared data model.
 
 ## Testing
 
