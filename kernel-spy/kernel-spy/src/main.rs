@@ -605,7 +605,11 @@ async fn main() -> anyhow::Result<()> {
 
         attr::enrich_flow_rows(&mut flows_rx);
         attr::enrich_flow_rows(&mut flows_tx);
-        if eff.ss_enrich {
+        let have_any_missing_pid = flows_rx
+            .iter()
+            .chain(flows_tx.iter())
+            .any(|row| row.local_pid.is_none());
+        if eff.ss_enrich || have_any_missing_pid {
             ss_enrich::enrich_flows_from_ss(&mut flows_rx, &mut flows_tx);
             attr::enrich_flow_rows(&mut flows_rx);
             attr::enrich_flow_rows(&mut flows_tx);

@@ -28,9 +28,8 @@ fn quad_matches_flow(local: (u32, u16), remote: (u32, u16), meta: &PacketMetadat
         || (local.0 == d && local.1 == dp && remote.0 == s && remote.1 == sp)
 }
 
-/// udp lines in `/proc/net/udp` often show unconnected sockets (`rem` all zeros) while packets
-/// still have a full 5-tuple (stub resolver style). strict quad match fails then — accept `local`
-/// matching either flow endpoint.
+/// UDP sockets are often unconnected or only loosely represented in `/proc/net/udp`, so best-
+/// effort correlation should fall back to a local-endpoint match when the exact 5-tuple misses.
 fn udp_proc_line_matches_flow(
     local: (u32, u16),
     remote: (u32, u16),
@@ -39,12 +38,9 @@ fn udp_proc_line_matches_flow(
     if quad_matches_flow(local, remote, meta) {
         return true;
     }
-    if remote.0 == 0 && remote.1 == 0 {
-        let s = (meta.src_ip, meta.src_port);
-        let d = (meta.dst_ip, meta.dst_port);
-        return local == s || local == d;
-    }
-    false
+    let s = (meta.src_ip, meta.src_port);
+    let d = (meta.dst_ip, meta.dst_port);
+    local == s || local == d
 }
 
 fn proc_line_matches_meta(meta: &PacketMetadata, local: (u32, u16), remote: (u32, u16)) -> bool {
@@ -57,40 +53,60 @@ fn proc_line_matches_meta(meta: &PacketMetadata, local: (u32, u16), remote: (u32
 
 fn proc_inode_for_ipv4(meta: &PacketMetadata, table_path: &str) -> Option<u64> {
     let data = fs::read_to_string(table_path).ok()?;
+    eprintln!(
+        "[DEBUG] proc_inode_for_ipv4: Looking in {} for flow src_port={} dst_port={} protocol={}",
+        table_path, meta.src_port, meta.dst_port, meta.protocol
+    );
+    let mut line_count = 0;
+    let mut matched_quads = 0;
     for line in data.lines().skip(1) {
+        line_count += 1;
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 10 {
             continue;
         }
-        let local = parse_proc_hex_quad(parts[1])?;
-        let remote = parse_proc_hex_quad(parts[2])?;
+        let local = match parse_proc_hex_quad(parts[1]) {
+            Some(q) => q,
+            None => continue,
+        };
+        let remote = match parse_proc_hex_quad(parts[2]) {
+            Some(q) => q,
+            None => continue,
+        };
         if !proc_line_matches_meta(meta, local, remote) {
             continue;
         }
+        matched_quads += 1;
+        eprintln!("[DEBUG] proc_inode_for_ipv4: MATCH at line {}", line_count);
         return parse_inode_from_proc_fields(&parts);
+    }
+    eprintln!(
+        "[DEBUG] proc_inode_for_ipv4: NO MATCH in {} lines (parsed {} quads)",
+        line_count, matched_quads
+    );
+    None
+}
+
+/// `/proc/net/tcp*` puts inode in the fixed column after `uid` and `timeout`.
+fn parse_inode_from_proc_fields(parts: &[&str]) -> Option<u64> {
+    let inode = parts.get(9)?.parse::<u64>().ok()?;
+    if inode > 0 {
+        return Some(inode);
     }
     None
 }
 
-/// inode column index shifted as proc gained extra fields; `parts.last()` is often `0`, not inode
-fn parse_inode_from_proc_fields(parts: &[&str]) -> Option<u64> {
-    if parts.len() > 12 {
-        if let Ok(v) = parts.get(9)?.parse::<u64>() {
-            if v > 0 {
-                return Some(v);
-            }
-        }
-    }
-    parts.iter().rev().find_map(|s| s.parse::<u64>().ok())
-}
-
 /// inode for this ipv4 flow in `/proc/net/tcp` or `/proc/net/udp`
 pub fn proc_inode_for_flow(meta: &PacketMetadata) -> Option<u64> {
-    match meta.protocol {
+    let inode = match meta.protocol {
         6 => proc_inode_for_ipv4(meta, "/proc/net/tcp"),
         17 => proc_inode_for_ipv4(meta, "/proc/net/udp"),
         _ => None,
+    };
+    if let Some(ino) = inode {
+        eprintln!("[DEBUG] proc_inode_for_flow: Found inode {} for flow", ino);
     }
+    inode
 }
 
 /// ipv6 5-tuple for tcp6/udp6 proc correlation (separate from ipv4 ebpf keys)
@@ -208,8 +224,10 @@ impl InodePidCache {
     pub fn refresh() -> Self {
         let mut inode_to_pid = HashMap::new();
         let Ok(proc_dir) = fs::read_dir("/proc") else {
+            eprintln!("[DEBUG] InodePidCache::refresh: FAILED to open /proc");
             return Self { inode_to_pid };
         };
+        let mut pid_count = 0;
         for ent in proc_dir.flatten() {
             let name = ent.file_name();
             let name = name.to_string_lossy();
@@ -219,6 +237,7 @@ impl InodePidCache {
             let Ok(pid) = name.parse::<u32>() else {
                 continue;
             };
+            pid_count += 1;
             let fd_dir = format!("/proc/{pid}/fd");
             let fds = match fs::read_dir(&fd_dir) {
                 Ok(f) => f,
@@ -242,6 +261,19 @@ impl InodePidCache {
                 inode_to_pid.entry(inode).or_insert(pid);
             }
         }
+        let found = inode_to_pid.len();
+        eprintln!(
+            "[DEBUG] InodePidCache::refresh: Scanned {} PIDs, found {} socket inodes",
+            pid_count, found
+        );
+        if !inode_to_pid.is_empty() {
+            eprintln!("[DEBUG] InodePidCache sample entries (first 5):");
+            for (inode, pid) in inode_to_pid.iter().take(5) {
+                eprintln!("  inode {} -> pid {}", inode, pid);
+            }
+        } else {
+            eprintln!("[DEBUG] InodePidCache: WARNING - no socket inodes found!");
+        }
         Self { inode_to_pid }
     }
 
@@ -257,7 +289,13 @@ impl InodePidCache {
 /// pid from proc net quad + inode cache (tcp and udp)
 pub fn pid_via_proc_socket(meta: &PacketMetadata, cache: &InodePidCache) -> Option<u32> {
     let inode = proc_inode_for_flow(meta)?;
-    cache.pid_for_inode(inode)
+    let pid = cache.pid_for_inode(inode);
+    if pid.is_some() {
+        eprintln!("[DEBUG] pid_via_proc_socket: Found pid {} for inode {}", pid.unwrap(), inode);
+    } else {
+        eprintln!("[DEBUG] pid_via_proc_socket: Inode {} NOT in cache (cache has {} entries)", inode, cache.len());
+    }
+    pid
 }
 
 #[cfg(test)]
@@ -300,10 +338,45 @@ mod tests {
     }
 
     #[test]
+    fn udp_fallback_matches_local_endpoint_even_with_nonzero_remote() {
+        let meta = PacketMetadata::new(ipv4(185, 125, 190, 56), ipv4(10, 40, 57, 100), 123, 48029, 17);
+        let local = (ipv4(185, 125, 190, 56), 123);
+        let remote = (ipv4(10, 40, 57, 100), 48029);
+        assert!(udp_proc_line_matches_flow(local, remote, &meta));
+    }
+
+    #[test]
     fn proc_parse_hex_localhost_roundtrip() {
         let q = parse_proc_hex_quad("0100007F:9090").expect("parse");
         assert_eq!(q.0, ipv4(127, 0, 0, 1));
         assert_eq!(q.1, 0x9090);
+    }
+
+    #[test]
+    fn parse_inode_uses_fixed_proc_column() {
+        let parts = vec![
+            "0",
+            "0100007F:0277",
+            "0100007F:D431",
+            "01",
+            "00000000:00000000",
+            "00:00000000",
+            "00000000",
+            "1000",
+            "0",
+            "424242",
+            "1",
+            "0000000000000000",
+            "0",
+        ];
+
+        assert_eq!(parse_inode_from_proc_fields(&parts), Some(424242));
+    }
+
+    #[test]
+    fn parse_inode_rejects_short_rows() {
+        let parts = vec!["0", "0100007F:0277", "0100007F:D431"];
+        assert_eq!(parse_inode_from_proc_fields(&parts), None);
     }
 
     fn ipv6_proc_field(ip: std::net::Ipv6Addr, port: u16) -> String {
@@ -344,7 +417,7 @@ mod tests {
         let local = ipv6_proc_field(std::net::Ipv6Addr::LOCALHOST, 443);
         let remote = ipv6_proc_field(std::net::Ipv6Addr::LOCALHOST, 55555);
         let line = format!(
-            "  0: {local} {remote} 01 00000000:00000000 00:00000000 00:00000000 00 0 0 999888"
+            "  0: {local} {remote} 01 00000000:00000000 00:00000000 00:00000000 1000 0 999888 1 0000000000000000 0"
         );
         let meta = Ipv6FlowMeta {
             src: std::net::Ipv6Addr::LOCALHOST,
