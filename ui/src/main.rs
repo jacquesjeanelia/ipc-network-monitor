@@ -168,7 +168,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ctx.request_repaint_after(Duration::from_millis(200));
 
         // Pull a snapshot of all state we need for rendering
         let (connected, snap, rx_hist, tx_hist, alert_log, rpc_result) = {
@@ -398,33 +398,27 @@ impl App {
             );
             ui.add_space(8.0);
 
-            ui.group(|ui| {
-                ui.label(RichText::new("Focus").strong());
-                ui.label(format!("Interface: {}", snap.iface));
-                ui.label(format!("Session: {}", snap.session.session_id));
-                ui.label(format!("Latest snapshot: {}", fmt_ts_ms(snap.ts_unix_ms)));
-            });
-
-            ui.add_space(12.0);
-            ui.heading(format!("RX Flows — {} entries", snap.flows_rx.len()));
-            flow_table(ui, &snap.flows_rx, "rx_tbl");
-            ui.add_space(16.0);
-            ui.heading(format!("TX Flows — {} entries", snap.flows_tx.len()));
-            flow_table(ui, &snap.flows_tx, "tx_tbl");
+            // ui.group(|ui| {
+            //     ui.label(RichText::new("Focus").strong());
+            //     ui.label(format!("Interface: {}", snap.iface));
+            //     ui.label(format!("Session: {}", snap.session.session_id));
+            //     ui.label(format!("Latest snapshot: {}", fmt_ts_ms(snap.ts_unix_ms)));
+            // });
 
             ui.add_space(16.0);
             ui.separator();
             ui.heading("Process and User Correlation");
             ui.label("This is the skeleton area for process/user drill-downs and inode attribution.");
             ui.add_space(6.0);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(RichText::new("Top Processes").strong());
                     if snap.aggregates_by_pid.is_empty() {
                         ui.colored_label(Color32::GRAY, "No process attribution yet.");
                     } else {
-                        for row in snap.aggregates_by_pid.iter().take(5) {
-                            ui.label(format!("pid={} {} ({})", row.pid, row.comm.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
+                        for row in snap.aggregates_by_pid.iter().take(20) {
+                            ui.label(format!("pid={} {} {} ({})", row.pid, format!("{:.1}%", row.share_percent), row.comm.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
                         }
                     }
                 });
@@ -434,8 +428,44 @@ impl App {
                     if snap.aggregates_by_user.is_empty() {
                         ui.colored_label(Color32::GRAY, "No user attribution yet.");
                     } else {
-                        for row in snap.aggregates_by_user.iter().take(5) {
-                            ui.label(format!("uid={} {} ({})", row.uid, row.username.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
+                        for row in snap.aggregates_by_user.iter().take(20) {
+                            ui.label(format!("uid={} {} {} ({})", row.uid, format!("{:.1}%", row.share_percent), row.username.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            ui.heading(format!("RX Flows — {} entries", snap.flows_rx.len()));
+            flow_table(ui, &snap.flows_rx, "rx_tbl");
+            ui.add_space(16.0);
+            ui.heading(format!("TX Flows — {} entries", snap.flows_tx.len()));
+            flow_table(ui, &snap.flows_tx, "tx_tbl");
+            
+            /* Aggregate History */
+            ui.add_space(12.0);
+            ui.separator();
+            ui.heading("Aggregate History (recent)");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Recent Process Aggregates").strong());
+                    if snap.aggregate_history_by_pid.is_empty() {
+                        ui.colored_label(Color32::GRAY, "No historical aggregates yet.");
+                    } else {
+                        for row in snap.aggregate_history_by_pid.iter().take(12) {
+                            ui.label(format!("{} {} pid={} {} ({})", fmt_ts_ms(row.ts_unix_ms), format!("{:.1}%", row.share_percent), row.pid, row.comm.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
+                        }
+                    }
+                });
+                ui.add_space(24.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Recent User Aggregates").strong());
+                    if snap.aggregate_history_by_user.is_empty() {
+                        ui.colored_label(Color32::GRAY, "No historical aggregates yet.");
+                    } else {
+                        for row in snap.aggregate_history_by_user.iter().take(12) {
+                            ui.label(format!("{} {} uid={} {} ({})", fmt_ts_ms(row.ts_unix_ms), format!("{:.1}%", row.share_percent), row.uid, row.username.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
                         }
                     }
                 });
@@ -450,11 +480,11 @@ fn flow_table(ui: &mut Ui, rows: &[FlowRow], id: &str) {
         .striped(true)
         .min_col_width(90.0)
         .show(ui, |ui| {
-            ui.label(RichText::new("Src IP").strong());
-            ui.label(RichText::new("Src Port").strong());
-            ui.label(RichText::new("Dst IP").strong());
-            ui.label(RichText::new("Dst Port").strong());
-            ui.label(RichText::new("Proto").strong());
+            ui.label(RichText::new("Source IP").strong());
+            ui.label(RichText::new("Source Port").strong());
+            ui.label(RichText::new("Destination IP").strong());
+            ui.label(RichText::new("Destination Port").strong());
+            ui.label(RichText::new("Protocol").strong());
             ui.label(RichText::new("Bytes").strong());
             ui.label(RichText::new("PID / User").strong());
             ui.end_row();

@@ -576,6 +576,9 @@ async fn main() -> anyhow::Result<()> {
     println!("=================================================");
     println!();
 
+    // Initialize aggregate history (keep last 100 snapshots)
+    let mut aggregate_history = aggregate::AggregateHistory::new(100);
+
     loop {
         let rx_totals = read_direction_totals(&monitor_rx);
         let tx_totals = read_direction_totals(&monitor_tx);
@@ -615,13 +618,19 @@ async fn main() -> anyhow::Result<()> {
             attr::enrich_flow_rows(&mut flows_tx);
         }
 
-        let (aggregates_by_pid, aggregates_by_user) =
-            aggregate::aggregates_from_flows(&flows_rx, &flows_tx);
-
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+
+        // Calculate total bytes for percentage calculation
+        let total_bytes = rx_totals.bytes.saturating_add(tx_totals.bytes);
+
+        let (aggregates_by_pid, aggregates_by_user) =
+            aggregate::aggregates_from_flows(&flows_rx, &flows_tx, ts, total_bytes);
+
+        // Push current aggregates to history
+        aggregate_history.push(&aggregates_by_pid, &aggregates_by_user);
 
         let tick_alerts = alert_engine.evaluate(ts, &rx_totals, &aggregates_by_pid);
 
@@ -644,8 +653,10 @@ async fn main() -> anyhow::Result<()> {
                 session_id: session_id.clone(),
                 window_start_ms,
             },
-            aggregates_by_pid,
-            aggregates_by_user,
+            aggregates_by_pid: aggregates_by_pid.clone(),
+            aggregates_by_user: aggregates_by_user.clone(),
+            aggregate_history_by_pid: aggregate_history.pid_history().to_vec(),
+            aggregate_history_by_user: aggregate_history.uid_history().to_vec(),
             alerts: tick_alerts,
         };
 
@@ -691,14 +702,14 @@ async fn main() -> anyhow::Result<()> {
         );
         if let Some(top) = snapshot.aggregates_by_pid.first() {
             println!(
-                "         top talker (pid): pid={} bytes_total={} comm={:?}",
-                top.pid, top.bytes_total, top.comm
+                "         top talker (pid): pid={} bytes_total={} share={:.1}% comm={:?}",
+                top.pid, top.bytes_total, top.share_percent, top.comm
             );
         }
         if let Some(top) = snapshot.aggregates_by_user.first() {
             println!(
-                "         top talker (user): uid={} bytes_total={} name={:?}",
-                top.uid, top.bytes_total, top.username
+                "         top talker (user): uid={} bytes_total={} share={:.1}% name={:?}",
+                top.uid, top.bytes_total, top.share_percent, top.username
             );
         }
         println!(

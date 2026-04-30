@@ -74,6 +74,12 @@ pub struct ProcessTrafficRow {
     #[serde(default)]
     pub comm: Option<String>,
     pub bytes_total: u64,
+    /// Timestamp when this aggregate was computed (unix ms)
+    #[serde(default)]
+    pub ts_unix_ms: u64,
+    /// Percentage of total traffic (0.0-100.0)
+    #[serde(default)]
+    pub share_percent: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -82,6 +88,12 @@ pub struct UserTrafficRow {
     #[serde(default)]
     pub username: Option<String>,
     pub bytes_total: u64,
+    /// Timestamp when this aggregate was computed (unix ms)
+    #[serde(default)]
+    pub ts_unix_ms: u64,
+    /// Percentage of total traffic (0.0-100.0)
+    #[serde(default)]
+    pub share_percent: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -111,6 +123,12 @@ pub struct MonitorSnapshotV1 {
     pub aggregates_by_pid: Vec<ProcessTrafficRow>,
     #[serde(default)]
     pub aggregates_by_user: Vec<UserTrafficRow>,
+    /// Historical aggregates from previous ticks (newer first, last 100 snapshots)
+    #[serde(default)]
+    pub aggregate_history_by_pid: Vec<ProcessTrafficRow>,
+    /// Historical aggregates from previous ticks (newer first, last 100 snapshots)
+    #[serde(default)]
+    pub aggregate_history_by_user: Vec<UserTrafficRow>,
     #[serde(default)]
     pub alerts: Vec<AlertEvent>,
 }

@@ -346,6 +346,20 @@ mod tests {
     }
 
     #[test]
+    fn udp6_fallback_matches_local_endpoint_even_with_nonzero_remote() {
+        let meta = Ipv6FlowMeta {
+            src: std::net::Ipv6Addr::LOCALHOST,
+            dst: "2001:db8::1".parse().unwrap(),
+            src_port: 12345,
+            dst_port: 53,
+            protocol: 17,
+        };
+        let local = (std::net::Ipv6Addr::LOCALHOST, 12345);
+        let remote = ("2001:db8::1".parse().unwrap(), 53);
+        assert!(udp6_proc_line_matches_flow(local, remote, &meta));
+    }
+
+    #[test]
     fn proc_parse_hex_localhost_roundtrip() {
         let q = parse_proc_hex_quad("0100007F:9090").expect("parse");
         assert_eq!(q.0, ipv4(127, 0, 0, 1));
