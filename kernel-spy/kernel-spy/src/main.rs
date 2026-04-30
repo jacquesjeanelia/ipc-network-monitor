@@ -67,6 +67,7 @@ fn protocol_name(p: u8) -> &'static str {
         6 => "TCP",
         17 => "UDP",
         1 => "ICMP",
+        2 => "IGMP",
         _ => "Other",
     }
 }

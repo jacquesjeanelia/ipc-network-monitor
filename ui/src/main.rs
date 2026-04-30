@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText, Ui};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 
-use common::{AlertEvent, FlowRow, MonitorSnapshotV1, parse_export_line};
+use common::{AlertEvent, FlowRow, MonitorSnapshotV1, ProcessTrafficRow, UserTrafficRow, parse_export_line};
 
 const HISTORY_CAP: usize = 120;
+const RECENT_SIGHTINGS_CAP: usize = 64;
 const EXPORT_SOCK: &str = "/tmp/ipc-netmon.sock";
 const CONTROL_SOCK: &str = "/tmp/ipc-netmon-ctl.sock";
 const MAX_ALERT_LOG: usize = 500;
@@ -46,10 +47,22 @@ fn fmt_ts_ms(ts_ms: u64) -> String {
     format!("{h:02}:{m:02}:{s:02} UTC")
 }
 
+fn fmt_pid_user(pid: Option<u32>, uid: Option<u32>, username: Option<&str>) -> String {
+    match (pid, uid, username) {
+        (Some(p), Some(u), Some(name)) => format!("pid={p} uid={u} {name}"),
+        (Some(p), Some(u), None) => format!("pid={p} uid={u}"),
+        (Some(p), None, Some(name)) => format!("pid={p} {name}"),
+        (Some(p), None, None) => format!("pid={p}"),
+        _ => "—".to_string(),
+    }
+}
+
 //shared state (background thread -> GUI) 
 
 struct SharedState {
     snapshot: Option<MonitorSnapshotV1>,
+    recent_process_sightings: VecDeque<ProcessTrafficRow>,
+    recent_user_sightings: VecDeque<UserTrafficRow>,
     rx_rate_history: VecDeque<[f64; 2]>, // [elapsed_secs, bytes/s]
     tx_rate_history: VecDeque<[f64; 2]>,
     prev_rx_bytes: Option<u64>,
@@ -65,6 +78,8 @@ impl SharedState {
     fn new() -> Self {
         Self {
             snapshot: None,
+            recent_process_sightings: VecDeque::new(),
+            recent_user_sightings: VecDeque::new(),
             rx_rate_history: VecDeque::new(),
             tx_rate_history: VecDeque::new(),
             prev_rx_bytes: None,
@@ -74,6 +89,34 @@ impl SharedState {
             connected: false,
             alert_log: Vec::new(),
             rpc_result: String::new(),
+        }
+    }
+
+    fn remember_process_sighting(&mut self, row: &ProcessTrafficRow) {
+        if let Some(pos) = self
+            .recent_process_sightings
+            .iter()
+            .position(|existing| existing.pid == row.pid)
+        {
+            self.recent_process_sightings.remove(pos);
+        }
+        self.recent_process_sightings.push_front(row.clone());
+        while self.recent_process_sightings.len() > RECENT_SIGHTINGS_CAP {
+            self.recent_process_sightings.pop_back();
+        }
+    }
+
+    fn remember_user_sighting(&mut self, row: &UserTrafficRow) {
+        if let Some(pos) = self
+            .recent_user_sightings
+            .iter()
+            .position(|existing| existing.uid == row.uid)
+        {
+            self.recent_user_sightings.remove(pos);
+        }
+        self.recent_user_sightings.push_front(row.clone());
+        while self.recent_user_sightings.len() > RECENT_SIGHTINGS_CAP {
+            self.recent_user_sightings.pop_back();
         }
     }
 
@@ -101,6 +144,13 @@ impl SharedState {
         self.prev_rx_bytes = Some(snap.rx.bytes);
         self.prev_tx_bytes = Some(snap.tx.bytes);
         self.prev_ts_ms = Some(snap.ts_unix_ms);
+
+        for row in &snap.aggregates_by_pid {
+            self.remember_process_sighting(row);
+        }
+        for row in &snap.aggregates_by_user {
+            self.remember_user_sighting(row);
+        }
 
         for alert in &snap.alerts {
             if self.alert_log.len() >= MAX_ALERT_LOG {
@@ -168,10 +218,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(200));
+        ctx.request_repaint_after(Duration::from_millis(500));
 
         // Pull a snapshot of all state we need for rendering
-        let (connected, snap, rx_hist, tx_hist, alert_log, rpc_result) = {
+        let (connected, snap, rx_hist, tx_hist, alert_log, rpc_result, recent_process_sightings, recent_user_sightings) = {
             let s = self.state.lock().unwrap();
             (
                 s.connected,
@@ -180,6 +230,8 @@ impl eframe::App for App {
                 s.tx_rate_history.iter().cloned().collect::<Vec<_>>(),
                 s.alert_log.clone(),
                 s.rpc_result.clone(),
+                s.recent_process_sightings.iter().cloned().collect::<Vec<_>>(),
+                s.recent_user_sightings.iter().cloned().collect::<Vec<_>>(),
             )
         };
 
@@ -231,7 +283,12 @@ impl eframe::App for App {
         // main content
         egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
             Tab::Dashboard => Self::show_dashboard(ui, snap.as_ref(), &rx_hist, &tx_hist),
-            Tab::Correlation => Self::show_correlation(ui, snap.as_ref()),
+            Tab::Correlation => Self::show_correlation(
+                ui,
+                snap.as_ref(),
+                &recent_process_sightings,
+                &recent_user_sightings,
+            ),
             Tab::Audit => Self::show_audit(ui, snap.as_ref(), &alert_log),
             Tab::Control => self.show_control(ui, &rpc_result),
         });
@@ -385,7 +442,12 @@ impl App {
 // Correlation tab
 
 impl App {
-    fn show_correlation(ui: &mut Ui, snap: Option<&MonitorSnapshotV1>) {
+    fn show_correlation(
+        ui: &mut Ui,
+        snap: Option<&MonitorSnapshotV1>,
+        recent_process_sightings: &[ProcessTrafficRow],
+        recent_user_sightings: &[UserTrafficRow],
+    ) {
         let Some(snap) = snap else {
             ui.label("No data yet.");
             return;
@@ -410,6 +472,43 @@ impl App {
             ui.heading("Process and User Correlation");
             ui.label("This is the skeleton area for process/user drill-downs and inode attribution.");
             ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Recent Process Sightings").strong());
+                    if recent_process_sightings.is_empty() {
+                        ui.colored_label(Color32::GRAY, "No recent process sightings yet.");
+                    } else {
+                        for row in recent_process_sightings.iter().take(12) {
+                            ui.label(format!(
+                                "{} pid={} {} ({})",
+                                fmt_ts_ms(row.ts_unix_ms),
+                                row.pid,
+                                row.comm.as_deref().unwrap_or("—"),
+                                fmt_bytes(row.bytes_total)
+                            ));
+                        }
+                    }
+                });
+                ui.add_space(24.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Recent User Sightings").strong());
+                    if recent_user_sightings.is_empty() {
+                        ui.colored_label(Color32::GRAY, "No recent user sightings yet.");
+                    } else {
+                        for row in recent_user_sightings.iter().take(12) {
+                            ui.label(format!(
+                                "{} uid={} {} ({})",
+                                fmt_ts_ms(row.ts_unix_ms),
+                                row.uid,
+                                row.username.as_deref().unwrap_or("—"),
+                                fmt_bytes(row.bytes_total)
+                            ));
+                        }
+                    }
+                });
+            });
+
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -417,7 +516,7 @@ impl App {
                     if snap.aggregates_by_pid.is_empty() {
                         ui.colored_label(Color32::GRAY, "No process attribution yet.");
                     } else {
-                        for row in snap.aggregates_by_pid.iter().take(20) {
+                        for row in snap.aggregates_by_pid.iter().take(10) {
                             ui.label(format!("pid={} {} {} ({})", row.pid, format!("{:.1}%", row.share_percent), row.comm.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
                         }
                     }
@@ -428,7 +527,7 @@ impl App {
                     if snap.aggregates_by_user.is_empty() {
                         ui.colored_label(Color32::GRAY, "No user attribution yet.");
                     } else {
-                        for row in snap.aggregates_by_user.iter().take(20) {
+                        for row in snap.aggregates_by_user.iter().take(10) {
                             ui.label(format!("uid={} {} {} ({})", row.uid, format!("{:.1}%", row.share_percent), row.username.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
                         }
                     }
@@ -500,14 +599,14 @@ fn flow_table(ui: &mut Ui, rows: &[FlowRow], id: &str) {
                     "ICMP" => Color32::from_rgb(0xcc, 0x88, 0xff),
                     _      => Color32::GRAY,
                 };
-                ui.colored_label(proto_color, &row.protocol);
-                ui.label(fmt_bytes(row.bytes));
-                let pid_user = match (row.local_pid, row.local_username.as_deref()) {
-                    (Some(p), Some(u)) => format!("{p} ({u})"),
-                    (Some(p), None)    => p.to_string(),
-                    _                  => "—".to_string(),
+                let proto_label = if row.protocol == "Other" {
+                    "Other (unsupported protocol)"
+                } else {
+                    &row.protocol
                 };
-                ui.label(pid_user);
+                ui.colored_label(proto_color, proto_label);
+                ui.label(fmt_bytes(row.bytes));
+                ui.label(fmt_pid_user(row.local_pid, row.local_uid, row.local_username.as_deref()));
                 ui.end_row();
             }
         });
