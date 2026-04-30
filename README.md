@@ -68,6 +68,102 @@ For production, prefer sockets under `/run/...` with **`0660`** and a dedicated 
 
 PlantUML diagrams are available under [docs/uml](docs/uml) and cover the component view, the snapshot export sequence, and the shared data model.
 
+## Architecture Overview
+
+The system is divided into **privilege layers**:
+
+1. **Privileged Layer (kernel-spy):** Runs as root or with `CAP_NET_ADMIN` + `CAP_BPF` capabilities. Loads eBPF probes, attaches to network ingress/egress, collects flow telemetry, and manages policy control.
+2. **Shared Libraries:** `common` (versioned JSON schema) and `kernel-spy-common` (eBPF-userspace types).
+3. **Unprivileged Layer:** `collector` and `ui` connect via Unix sockets to consume data and issue RPC commands. No special privileges required.
+
+**Key flows:**
+
+- **Monitoring path:** eBPF XDP/TC probes → kernel-spy aggregates → MonitorSnapshotV1 JSON → Unix export socket → UI/collector
+- **Control path:** UI/ctl client → JSON RPC → Unix control socket → kernel-spy policy engine → nftables/tc/audit log
+
+See [Component Diagram](docs/uml/component.puml) and [Sequence Diagrams](docs/uml/sequence.puml) for details.
+
+## Security Model
+
+- **Privilege boundary:** kernel-spy alone touches kernel space; `ui`/`collector` run unprivileged.
+- **IPC isolation:** Unix domain sockets (default `/tmp/ipc-netmon*.sock`) enforce OS-level access control.
+- **Audit trail:** All policy operations logged in append-only file (kernel enforces `O_APPEND`), preventing tampering.
+- **Capabilities:** kernel-spy requires `CAP_NET_ADMIN`, `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_RAW`, `CAP_SYS_RESOURCE` on Linux 5.8+.
+
+For detailed threat model and capability justification, see [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
+
+## Monitoring & Alerting
+
+- **Real-time metrics:** RX/TX throughput (bytes/packets), per-flow and per-process aggregates, connection health (TCP retransmit rate).
+- **Alerts:** Threshold-based (RX spike, EMA-smoothed anomaly, top-process bytes).
+- **Configuration:** `--alert-rx-bytes-per-tick`, `--alert-rx-ema-delta-threshold`, `--alert-top-pid-bytes`.
+
+See [docs/ALERTING_DESIGN.md](docs/ALERTING_DESIGN.md) for alert types and configuration.
+
+## Control & Policy
+
+- **Policy lifecycle:** preview → apply (with backup) → rollback.
+- **Operations:** Drop by destination IP, rate-limit, UID/GID scope.
+- **Backup & rollback:** Snapshots nftables state before each apply; can restore previous state.
+- **Audit logging:** Every policy operation recorded with timestamp, action, detail, outcome, session ID.
+
+See [docs/POLICY_LIFECYCLE.md](docs/POLICY_LIFECYCLE.md) for workflows.
+
+## Traffic Control (Shaping)
+
+Optional `tc netem` delay injection (not drop-based). Configure with:
+
+```sh
+./kernel-spy -i eth0 --netem-delay-ms 100 --netem-confirm
+```
+
+Adds configurable latency to test application resilience. Confirmation flag prevents accidental > 2 second delays.
+
+See [docs/PROBE_LIFECYCLE.md](docs/PROBE_LIFECYCLE.md#traffic-control-tc_controlgrs) for details.
+
+## Export & Reporting
+
+- **JSON export:** Newline-delimited JSON over Unix socket (default `1/sec`).
+- **CSV export:** Flows, processes, users, alerts exportable as CSV.
+- **Session history:** Ring buffer retains last N snapshots; `session_dump_file` RPC exports all to disk.
+- **Formats:** JSON (MonitorSnapshotV1 schema), CSV (flows, processes, users), JSON array (session history).
+
+See [docs/EXPORT_FORMATS.md](docs/EXPORT_FORMATS.md) for export methods and format specifications.
+
+## Error Handling & Resilience
+
+- **Socket reconnection:** UI auto-retries with exponential backoff on connection loss.
+- **Probe fallback:** XDP tries DRV → SKB → GENERIC modes; degrades gracefully if all fail.
+- **Partial data:** If JSON parse fails, UI skips line and continues (doesn't crash).
+- **Status reporting:** ProbeStatus in each snapshot shows attach state and errors.
+
+See [docs/ERROR_HANDLING.md](docs/ERROR_HANDLING.md) for error scenarios and recovery.
+
+## User Interface
+
+- **5 views:** Dashboard (live throughput), Correlation (flow attribution), Control (policy editor), Audit (logs), Settings.
+- **Drill-downs:** Click flow → Correlation; click process → show related flows; right-click → block/rate-limit actions.
+- **Refresh rate:** 1 snapshot/sec (real-time display), configurable for high-CPU environments.
+
+See [docs/UI_ARCHITECTURE.md](docs/UI_ARCHITECTURE.md), [docs/DASHBOARD_DESIGN.md](docs/DASHBOARD_DESIGN.md), [docs/UI_INTERACTIONS.md](docs/UI_INTERACTIONS.md) for UI design.
+
+## Documentation
+
+Comprehensive design documents are available in [docs/](docs/):
+
+- **[UI_ARCHITECTURE.md](docs/UI_ARCHITECTURE.md):** 4-view structure, navigation, data flows, error states
+- **[CORRELATION_DESIGN.md](docs/CORRELATION_DESIGN.md):** Inode cache, ss enrichment, unknown flow handling
+- **[SECURITY_MODEL.md](docs/SECURITY_MODEL.md):** Privilege boundary, IPC isolation, audit integrity, threat model
+- **[CAPABILITY_REQUIREMENTS.md](docs/CAPABILITY_REQUIREMENTS.md):** Linux capabilities, kernel version constraints, WSL notes
+- **[POLICY_LIFECYCLE.md](docs/POLICY_LIFECYCLE.md):** Apply/preview/rollback workflow, atomicity, backup strategy
+- **[SESSION_MANAGEMENT.md](docs/SESSION_MANAGEMENT.md):** Ring buffer lifecycle, RPC interface, retention policy
+- **[PROBE_LIFECYCLE.md](docs/PROBE_LIFECYCLE.md):** XDP/TC attachment, fallback modes, graceful degradation
+- **[ALERTING_DESIGN.md](docs/ALERTING_DESIGN.md):** Alert types, thresholds, EMA smoothing, delivery to UI
+- **[EXPORT_FORMATS.md](docs/EXPORT_FORMATS.md):** JSON/CSV formats, per-view export options, use cases
+- **[ERROR_HANDLING.md](docs/ERROR_HANDLING.md):** Socket communication resilience, retry strategies, error scenarios
+- **[DASHBOARD_DESIGN.md](docs/DASHBOARD_DESIGN.md):** Layout, refresh rate, chart design, drill-down interactions
+- **[UI_INTERACTIONS.md](docs/UI_INTERACTIONS.md):** View navigation, filter propagation, cross-view actions
+
 ## Testing
 
 From the repo root, `cargo test --workspace` runs unit tests (no root required). Tests under `kernel-spy/tests/` may include `#[ignore]` cases for host-only validation; run those explicitly with `cargo test -p kernel-spy -- --ignored`.

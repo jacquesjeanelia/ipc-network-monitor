@@ -27,4 +27,8 @@ impl SessionRing {
     pub fn dump(&self) -> Vec<MonitorSnapshotV1> {
         self.inner.iter().cloned().collect()
     }
+
+    pub fn latest(&self) -> Option<MonitorSnapshotV1> {
+        self.inner.back().cloned()
+    }
 }

@@ -41,10 +41,25 @@ fn xdp_flags_from_str(s: &str) -> anyhow::Result<XdpFlags> {
         "skb" | "skb_mode" => Ok(XdpFlags::SKB_MODE),
         "drv" | "drv_mode" | "driver" => Ok(XdpFlags::DRV_MODE),
         "hw" | "hw_mode" => Ok(XdpFlags::HW_MODE),
-        "generic" | "gen" => Ok(XdpFlags::SKB_MODE),
+        "generic" | "gen" => Ok(XdpFlags::empty()),
         "empty" | "none" | "default" => Ok(XdpFlags::empty()),
         _ => anyhow::bail!("unknown --xdp-mode {s} (try skb, drv, hw, generic, empty)"),
     }
+}
+
+fn xdp_attach_order(mode: &str) -> anyhow::Result<Vec<(&'static str, XdpFlags)>> {
+    let order = match mode.to_lowercase().as_str() {
+        "drv" | "drv_mode" | "driver" => vec!["drv", "skb", "generic"],
+        "skb" | "skb_mode" => vec!["skb", "generic", "drv"],
+        "hw" | "hw_mode" => vec!["hw", "drv", "skb", "generic"],
+        "generic" | "gen" | "empty" | "none" | "default" => vec!["generic", "skb", "drv"],
+        _ => anyhow::bail!("unknown --xdp-mode {mode} (try skb, drv, hw, generic, empty)"),
+    };
+
+    order
+        .into_iter()
+        .map(|name| Ok((name, xdp_flags_from_str(name)?)))
+        .collect()
 }
 
 fn protocol_name(p: u8) -> &'static str {
@@ -183,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .and_then(|f| f.seed_demo_blocklist)
             .unwrap_or(false);
+    let force_attach_fail = std::env::var_os("KSPY_FORCE_ATTACH_FAIL").is_some();
 
     let audit_path = cli
         .audit_log
@@ -230,28 +246,64 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let xdp_flags = xdp_flags_from_str(&xdp_mode)?;
-    let program: &mut Xdp = ebpf.program_mut("kernel_spy").unwrap().try_into()?;
-    program.load()?;
-    program
-        .attach(&iface, xdp_flags)
-        .with_context(|| {
-            format!(
-                "attach XDP on interface {iface:?} - unknown or wrong name; use exact name from `ip -br link` or `ls /sys/class/net/` (try `-i lo` to smoke-test)"
-            )
-        })?;
-    log::info!("Attached XDP to ingress of {}", iface);
-
-    let _ = qdisc_add_clsact(&iface);
-    let tc_program: &mut SchedClassifier = ebpf.program_mut("kernel_spy_tc").unwrap().try_into()?;
-    tc_program.load()?;
-    tc_program
-        .attach(&iface, TcAttachType::Egress)
-        .with_context(|| format!("attach TC egress on interface {iface:?}"))?;
-    log::info!("Attached TC egress classifier on {}", iface);
-
-    let mut tcp_retransmit_trace_attached = false;
     let mut probe_errors: Vec<String> = Vec::new();
+    let mut xdp_attached = false;
+    let mut tc_egress_attached = false;
+    let mut tcp_retransmit_trace_attached = false;
+
+    if force_attach_fail {
+        probe_errors.push("forced attach failure via KSPY_FORCE_ATTACH_FAIL".into());
+    } else {
+        let xdp_attempts = xdp_attach_order(&xdp_mode)?;
+        match ebpf.program_mut("kernel_spy") {
+            Some(program) => {
+                let program: &mut Xdp = program.try_into()?;
+                program.load()?;
+                for (mode_name, flags) in xdp_attempts {
+                    match program.attach(&iface, flags) {
+                        Ok(_link_id) => {
+                            xdp_attached = true;
+                            log::info!("Attached XDP ({mode_name}) to ingress of {}", iface);
+                            break;
+                        }
+                        Err(e) => {
+                            probe_errors.push(format!("XDP {mode_name} attach failed: {e:#}"));
+                            warn!("XDP {mode_name} attach failed (degraded): {e:#}");
+                        }
+                    }
+                }
+                if !xdp_attached {
+                    probe_errors.push("XDP attach failed in all fallback modes; running degraded".into());
+                }
+            }
+            None => {
+                probe_errors.push("XDP program lookup failed: program kernel_spy not found".into());
+                warn!("XDP program lookup failed (degraded): program kernel_spy not found");
+            }
+        }
+
+        let _ = qdisc_add_clsact(&iface);
+        match ebpf.program_mut("kernel_spy_tc") {
+            Some(program) => {
+                let tc_program: &mut SchedClassifier = program.try_into()?;
+                tc_program.load()?;
+                match tc_program.attach(&iface, TcAttachType::Egress) {
+                    Ok(_link_id) => {
+                        tc_egress_attached = true;
+                        log::info!("Attached TC egress classifier on {}", iface);
+                    }
+                    Err(e) => {
+                        probe_errors.push(format!("TC egress attach failed: {e:#}"));
+                        warn!("TC egress attach failed (degraded): {e:#}");
+                    }
+                }
+            }
+            None => {
+                probe_errors.push("TC program lookup failed: program kernel_spy_tc not found".into());
+                warn!("TC program lookup failed (degraded): program kernel_spy_tc not found");
+            }
+        }
+    }
 
     if !skip_tcp_retransmit_trace {
         let r: anyhow::Result<()> = (|| {
@@ -337,15 +389,6 @@ async fn main() -> anyhow::Result<()> {
         probe_errors.push("nft: binary not found in PATH".into());
     }
 
-    let probe_status_snapshot = ProbeStatus {
-        xdp_attached: true,
-        tc_egress_attached: true,
-        tcp_retransmit_trace_attached,
-        cgroup_pid_hooks_attached: false, // legacy field: cgroup BPF PID path not used (proc + ss)
-        nftables_ready: nft_ready,
-        errors: probe_errors,
-    };
-
     let mut netem_applied = false;
     if let Some(ref fc) = file_cfg {
         if let Some(ms) = fc.netem_delay_ms {
@@ -361,17 +404,40 @@ async fn main() -> anyhow::Result<()> {
                     ms
                 );
             }
-            tc_control::apply_root_netem_delay_ms(&iface, ms)?;
-            netem_applied = true;
-            control::audit(
-                audit_path.as_deref(),
-                "tc_netem",
-                &format!("applied netem delay {ms}ms on {}", iface),
-                Some("success"),
-                Some(session_id.as_str()),
-            )?;
+            match tc_control::apply_root_netem_delay_ms(&iface, ms) {
+                Ok(()) => {
+                    netem_applied = true;
+                    control::audit(
+                        audit_path.as_deref(),
+                        "tc_netem",
+                        &format!("applied netem delay {ms}ms on {}", iface),
+                        Some("success"),
+                        Some(session_id.as_str()),
+                    )?;
+                }
+                Err(e) => {
+                    probe_errors.push(format!("tc netem apply: {e:#}"));
+                    warn!("tc netem apply failed (degraded): {e:#}");
+                    let _ = control::audit(
+                        audit_path.as_deref(),
+                        "tc_netem",
+                        &format!("failed netem delay {ms}ms on {} err={e:#}", iface),
+                        Some("failure"),
+                        Some(session_id.as_str()),
+                    );
+                }
+            }
         }
     }
+
+    let probe_status_snapshot = ProbeStatus {
+        xdp_attached,
+        tc_egress_attached,
+        tcp_retransmit_trace_attached,
+        cgroup_pid_hooks_attached: false, // legacy field: cgroup BPF PID path not used (proc + ss)
+        nftables_ready: nft_ready,
+        errors: probe_errors,
+    };
 
     let monitor_rx = Array::try_from(ebpf.map("MONITOR_RX_MAP").unwrap())?;
     let monitor_tx = Array::try_from(ebpf.map("MONITOR_TX_MAP").unwrap())?;

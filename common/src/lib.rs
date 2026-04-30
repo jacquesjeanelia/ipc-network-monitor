@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod export_formats;
+
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// legacy sample shape (older clients still send this)
