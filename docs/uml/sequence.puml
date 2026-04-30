@@ -7,20 +7,30 @@ actor Operator
 participant "kernel-spy" as kernel_spy
 participant "kernel-spy-ebpf" as kernel_spy_ebpf
 participant "Unix export socket" as export_socket
-participant "collector / ui" as client
+participant "collector / ui" as export_client
+participant "ctl client" as ctl_client
+participant "Unix control socket" as control_socket
 
 Operator -> kernel_spy : start daemon on interface
 kernel_spy -> kernel_spy_ebpf : load and attach XDP / TC programs
-kernel_spy -> kernel_spy_ebpf : read BPF maps and health counters
 kernel_spy -> export_socket : bind /tmp/ipc-netmon.sock
+kernel_spy -> control_socket : bind /tmp/ipc-netmon-ctl.sock
+
+opt operator control action
+  ctl_client -> control_socket : send JSON RPC request (e.g. ping/session_dump/nft_*)
+  control_socket -> kernel_spy : dispatch method
+  kernel_spy --> control_socket : JSON RPC result
+  control_socket --> ctl_client : one-line JSON response
+end
+
+export_client -> export_socket : connect once
 
 loop each snapshot interval
-  kernel_spy -> kernel_spy_ebpf : read flow stats and counters
+  kernel_spy_ebpf --> kernel_spy : send flow stats and counters
   kernel_spy -> kernel_spy : aggregate MonitorSnapshotV1
   kernel_spy -> export_socket : write one JSON line
-  client -> export_socket : connect and read lines
-  export_socket --> client : ExportLine or legacy snapshot JSON
-  client -> client : parse_export_line()
+  export_socket --> export_client : ExportLine or legacy snapshot JSON
+  export_client -> export_client : parse_export_line()
 end
 
 @enduml

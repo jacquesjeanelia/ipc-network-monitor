@@ -8,6 +8,7 @@ package "Userspace" {
   [kernel-spy] as kernel_spy
   [collector] as collector
   [ui] as ui
+  [ops / admin ctl client] as ctl_client
 }
 
 package "Shared Libraries" {
@@ -25,26 +26,17 @@ database "Unix socket\n/tmp/ipc-netmon-ctl.sock" as control_socket
 kernel_spy --> kernel_spy_ebpf : loads / attaches
 kernel_spy --> kernel_spy_common : flow keys, counters
 kernel_spy --> common : builds MonitorSnapshotV1
-kernel_spy --> export_socket : publishes snapshots
-kernel_spy --> control_socket : serves control RPC
+kernel_spy --> export_socket : write snapshots
+export_socket --> collector : read snapshots
+export_socket --> ui : read snapshots
 
-collector --> export_socket : read snapshots
-ui --> export_socket : read snapshots
+kernel_spy --> control_socket : bind / receive requests
+ctl_client --> control_socket : send JSON RPC request
+control_socket --> ctl_client : send JSON RPC response
 collector --> common : parse_export_line()
 ui --> common : parse_export_line()
 
 kernel_spy_ebpf --> kernel_spy_common : PacketMetadata / maps
 
-note right of kernel_spy
-Privileged daemon:
-XDP + TC attach, BPF map reads,
-nftables / session control.
-end note
-
-note bottom of export_socket
-Line-delimited JSON export.
-Accepts wrapped ExportLine or
-legacy MonitorSnapshotV1 JSON.
-end note
 
 @enduml
