@@ -1,14 +1,32 @@
 @startuml
-title IPC Network Monitor - Component Diagram
+title IPC Network Monitor - Component Diagram (Complete)
 
 skinparam componentStyle rectangle
 skinparam shadowing false
 
-package "Userspace" {
-  [kernel-spy] as kernel_spy
+package "Userspace Privileged (kernel-spy)" {
+  [eBPF Loader] as ebpf_loader
+  [Probe Registry] as probe_registry
+  [Probe Lifecycle Manager] as probe_lifecycle
+  [Flow Correlator] as flow_correlator
+  [Inode Cache] as inode_cache
+  [ss Enricher] as ss_enricher
+  [User Cache] as user_cache
+  [SessionRing Buffer] as session_ring
+  [Alert Engine] as alert_engine
+  [PolicyEngine] as policy_engine
+  [nftables Backup Store] as nft_backup
+  [Audit Log Writer] as audit_log
+  [TC Control] as tc_control
+  [Export Formatter] as export_fmt
+  [RPC Dispatcher] as rpc_dispatch
+  [Main Loop] as main_loop
+}
+
+package "Userspace Unprivileged" {
   [collector] as collector
   [ui] as ui
-  [ops / admin ctl client] as ctl_client
+  [ctl client] as ctl_client
 }
 
 package "Shared Libraries" {
@@ -18,25 +36,68 @@ package "Shared Libraries" {
 
 package "Kernel Space" {
   [kernel-spy-ebpf] as kernel_spy_ebpf
+  [eBPF Maps] as ebpf_maps
+  [XDP Ingress] as xdp_ingress
+  [TC Egress] as tc_egress
+  [Tracepoints] as tracepoints
 }
 
 database "Unix socket\n/tmp/ipc-netmon.sock" as export_socket
 database "Unix socket\n/tmp/ipc-netmon-ctl.sock" as control_socket
+database "/tmp/ipc-netmon-audit.log" as audit_file
+database "/tmp/ipc-netmon-state/" as state_dir
 
-kernel_spy --> kernel_spy_ebpf : loads / attaches
-kernel_spy --> kernel_spy_common : flow keys, counters
-kernel_spy --> common : builds MonitorSnapshotV1
-kernel_spy --> export_socket : write snapshots
-export_socket --> collector : read snapshots
-export_socket --> ui : read snapshots
+ebpf_loader --> kernel_spy_ebpf : loads programs
+probe_registry --> ebpf_loader : manages attachments
+probe_lifecycle --> probe_registry : handles fallback modes
+probe_lifecycle --> xdp_ingress : XDP (DRV→SKB→GENERIC)
+probe_lifecycle --> tc_egress : TC qdisc
+probe_lifecycle --> tracepoints : tcp_retransmit_skb
 
-kernel_spy --> control_socket : bind / receive requests
-ctl_client --> control_socket : send JSON RPC request
-control_socket --> ctl_client : send JSON RPC response
+main_loop --> ebpf_maps : reads counters
+flow_correlator --> inode_cache : /proc/*/fd scanning
+inode_cache --> user_cache : resolves UID→username
+ss_enricher --> user_cache : optional ss(8) cross-check
+flow_correlator --> common : outputs FlowRow
+user_cache --> common : outputs UserTrafficRow
+
+alert_engine --> common : monitors MonitorSnapshotV1
+alert_engine --> common : generates AlertEvent
+
+session_ring --> common : stores MonitorSnapshotV1
+
+policy_engine --> kernel_spy_common : blocklist ops
+policy_engine --> nft_backup : backup before apply
+policy_engine --> audit_log : audit entries
+tc_control --> audit_log : audit tc/netem
+
+export_fmt --> common : MonitorSnapshotV1 → JSON
+export_fmt --> export_socket : write newline-JSON
+
+rpc_dispatch --> policy_engine : RPC methods
+rpc_dispatch --> session_ring : session_dump
+rpc_dispatch --> audit_log : session history
+rpc_dispatch --> control_socket : listen for requests
+
+main_loop --> flow_correlator : per snapshot
+main_loop --> alert_engine : per snapshot
+main_loop --> session_ring : per snapshot
+main_loop --> export_fmt : per snapshot
+main_loop --> rpc_dispatch : async dispatch
+
+collector --> export_socket : read snapshots
+ui --> export_socket : read snapshots
+ctl_client --> control_socket : send RPC
+control_socket --> rpc_dispatch : dispatch
+
 collector --> common : parse_export_line()
 ui --> common : parse_export_line()
 
-kernel_spy_ebpf --> kernel_spy_common : PacketMetadata / maps
+audit_log --> audit_file : O_APPEND writes
+nft_backup --> state_dir : JSON backups
+
+kernel_spy_ebpf --> kernel_spy_common : PacketMetadata
+ebpf_maps --> kernel_spy_common : map key types
 
 
 @enduml

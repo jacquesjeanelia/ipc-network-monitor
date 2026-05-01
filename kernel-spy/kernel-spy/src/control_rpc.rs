@@ -12,6 +12,7 @@ use crate::control;
 use crate::nft;
 use crate::session_history::SessionRing;
 use crate::socket_perm;
+use common::export_formats;
 
 #[derive(Debug, Deserialize)]
 struct ControlRequest {
@@ -51,6 +52,77 @@ fn write_json_atomic(path: &Path, payload: &serde_json::Value) -> Result<(), Str
     Ok(())
 }
 
+fn write_text_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let fname = path
+        .file_name()
+        .ok_or_else(|| "path has no file name".to_string())?;
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp.{}.{}",
+        fname.to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&tmp, contents).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn write_bundle_file(path: &Path, contents: &str) -> Result<(), String> {
+    write_text_atomic(path, contents)
+}
+
+fn write_bundle_json(path: &Path, payload: &serde_json::Value) -> Result<(), String> {
+    write_json_atomic(path, payload)
+}
+
+fn csv_export_kind_to_string(
+    ring: &Arc<Mutex<SessionRing>>,
+    kind: &str,
+) -> Result<String, String> {
+    let snap = ring
+        .lock()
+        .ok()
+        .and_then(|g| g.latest())
+        .ok_or_else(|| "no snapshot available".to_string())?;
+
+    match kind {
+        "flows" => export_formats::snapshot_flows_to_csv(&snap).map_err(|e| e.to_string()),
+        "processes" => export_formats::snapshot_processes_to_csv(&snap).map_err(|e| e.to_string()),
+        "users" => export_formats::snapshot_users_to_csv(&snap).map_err(|e| e.to_string()),
+        "alerts" => export_formats::snapshot_alerts_to_csv(&snap).map_err(|e| e.to_string()),
+        _ => Err(format!("unknown csv kind {kind} (try flows, processes, users, alerts)")),
+    }
+}
+
+fn write_session_csv_bundle(
+    snaps: &[common::MonitorSnapshotV1],
+    bundle_dir: &Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(bundle_dir).map_err(|e| e.to_string())?;
+    let flows = export_formats::session_flows_to_csv(snaps).map_err(|e| e.to_string())?;
+    let processes = export_formats::session_processes_to_csv(snaps).map_err(|e| e.to_string())?;
+    let users = export_formats::session_users_to_csv(snaps).map_err(|e| e.to_string())?;
+    let alerts = export_formats::session_alerts_to_csv(snaps).map_err(|e| e.to_string())?;
+    write_bundle_file(&bundle_dir.join("flows.csv"), &flows)?;
+    write_bundle_file(&bundle_dir.join("processes.csv"), &processes)?;
+    write_bundle_file(&bundle_dir.join("users.csv"), &users)?;
+    write_bundle_file(&bundle_dir.join("alerts.csv"), &alerts)?;
+
+    let summary = json!({
+        "snapshots": snaps.len(),
+        "flows_rows": flows.lines().count().saturating_sub(1),
+        "process_rows": processes.lines().count().saturating_sub(1),
+        "user_rows": users.lines().count().saturating_sub(1),
+        "alert_rows": alerts.lines().count().saturating_sub(1),
+    });
+    write_bundle_json(&bundle_dir.join("stats.json"), &summary)
+}
+
 async fn handle_line(
     line: &str,
     ring: &Arc<Mutex<SessionRing>>,
@@ -79,9 +151,40 @@ async fn handle_line(
             if path_s.is_empty() {
                 return respond_err("params.path required");
             }
+            let format = req
+                .params
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("json");
             let path = PathBuf::from(path_s);
             let path_disp = path.display().to_string();
             let snaps = ring.lock().ok().map(|g| g.dump()).unwrap_or_default();
+            if format == "csv_bundle" {
+                let res = tokio::task::spawn_blocking(move || write_session_csv_bundle(&snaps, &path)).await;
+                return match res {
+                    Ok(Ok(())) => {
+                        let _ = control::audit(
+                            audit_path.as_deref(),
+                            "session_dump_file",
+                            &format!("path={path_disp} format=csv_bundle"),
+                            Some("success"),
+                            sid,
+                        );
+                        respond_ok(json!({ "written": path_disp, "format": "csv_bundle" }))
+                    }
+                    Ok(Err(e)) => {
+                        let _ = control::audit(
+                            audit_path.as_deref(),
+                            "session_dump_file",
+                            &format!("path={path_disp} format=csv_bundle err={e}"),
+                            Some("failure"),
+                            sid,
+                        );
+                        respond_err(e)
+                    }
+                    Err(e) => respond_err(e.to_string()),
+                };
+            }
             let v = match serde_json::to_value(&snaps) {
                 Ok(v) => v,
                 Err(e) => return respond_err(e.to_string()),
@@ -104,6 +207,49 @@ async fn handle_line(
                         audit_path.as_deref(),
                         "session_dump_file",
                         &format!("path={path_disp} err={e}"),
+                        Some("failure"),
+                        sid,
+                    );
+                    respond_err(e)
+                }
+                Err(e) => respond_err(e.to_string()),
+            }
+        }
+        "export_flows_csv" | "export_processes_csv" | "export_users_csv" | "export_alerts_csv" => {
+            let path_s = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if path_s.is_empty() {
+                return respond_err("params.path required");
+            }
+            let kind = match req.method.as_str() {
+                "export_flows_csv" => "flows",
+                "export_processes_csv" => "processes",
+                "export_users_csv" => "users",
+                "export_alerts_csv" => "alerts",
+                _ => unreachable!(),
+            };
+            let path = PathBuf::from(path_s);
+            let path_disp = path.display().to_string();
+            let csv = match csv_export_kind_to_string(ring, kind) {
+                Ok(csv) => csv,
+                Err(e) => return respond_err(e),
+            };
+            let res = tokio::task::spawn_blocking(move || write_text_atomic(&path, &csv)).await;
+            match res {
+                Ok(Ok(())) => {
+                    let _ = control::audit(
+                        audit_path.as_deref(),
+                        req.method.as_str(),
+                        &format!("kind={kind} path={path_disp}"),
+                        Some("success"),
+                        sid,
+                    );
+                    respond_ok(json!({ "written": path_disp, "kind": kind }))
+                }
+                Ok(Err(e)) => {
+                    let _ = control::audit(
+                        audit_path.as_deref(),
+                        req.method.as_str(),
+                        &format!("kind={kind} path={path_disp} err={e}"),
                         Some("failure"),
                         sid,
                     );

@@ -36,14 +36,27 @@ fn udp_proc_line_matches_flow(
     remote: (u32, u16),
     meta: &PacketMetadata,
 ) -> bool {
+    // 1. Try a strict 5-tuple match first (for connected UDP sockets)
     if quad_matches_flow(local, remote, meta) {
         return true;
     }
+
+    // 2. Handle unconnected UDP sockets (listener servers where remote is 0.0.0.0:0)
     if remote.0 == 0 && remote.1 == 0 {
         let s = (meta.src_ip, meta.src_port);
         let d = (meta.dst_ip, meta.dst_port);
-        return local == s || local == d;
+
+        // Exact match (app bound to a specific IP like 127.0.0.1)
+        if local == s || local == d {
+            return true;
+        }
+
+        // WILDCARD MATCH: App bound to 0.0.0.0 (INADDR_ANY). Just check the ports!
+        if local.0 == 0 {
+            return local.1 == s.1 || local.1 == d.1;
+        }
     }
+    
     false
 }
 
@@ -56,14 +69,38 @@ fn proc_line_matches_meta(meta: &PacketMetadata, local: (u32, u16), remote: (u32
 }
 
 fn proc_inode_for_ipv4(meta: &PacketMetadata, table_path: &str) -> Option<u64> {
-    let data = fs::read_to_string(table_path).ok()?;
+    let data = match std::fs::read_to_string(table_path) {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    
+    // Prove we actually entered the function for the packet
+    let is_target = meta.src_port == 80 || meta.dst_port == 80 || meta.src_port == 8888 || meta.dst_port == 8888;
+    if is_target {
+        println!("DEBUG -> Searching {} for Packet (Src: {}, Dst: {})", 
+                 table_path, meta.src_port, meta.dst_port);
+    }
+
     for line in data.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 10 {
             continue;
         }
-        let local = parse_proc_hex_quad(parts[1])?;
-        let remote = parse_proc_hex_quad(parts[2])?;
+        
+        // CRITICAL FIX: Handle parsing errors by skipping the line, NOT aborting the function
+        let local = match parse_proc_hex_quad(parts[1]) {
+            Some(v) => v,
+            None => continue,
+        };
+        let remote = match parse_proc_hex_quad(parts[2]) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        if is_target && (local.1 == 80 || remote.1 == 80 || local.1 == 8888 || remote.1 == 8888) {
+            println!("DEBUG -> PROC line parsed: local port={}, remote port={}", local.1, remote.1);
+        }
+
         if !proc_line_matches_meta(meta, local, remote) {
             continue;
         }
@@ -74,13 +111,17 @@ fn proc_inode_for_ipv4(meta: &PacketMetadata, table_path: &str) -> Option<u64> {
 
 /// inode column index shifted as proc gained extra fields; `parts.last()` is often `0`, not inode
 fn parse_inode_from_proc_fields(parts: &[&str]) -> Option<u64> {
-    if parts.len() > 12 {
-        if let Ok(v) = parts.get(9)?.parse::<u64>() {
-            if v > 0 {
-                return Some(v);
+    // In Linux /proc/net files, the inode is strictly the 10th column (index 9).
+    // Always attempt to parse it first before falling back.
+    if let Some(inode_str) = parts.get(9) {
+        if let Ok(inode) = inode_str.parse::<u64>() {
+            if inode > 0 {
+                return Some(inode);
             }
         }
     }
+    
+    // Fallback: search backwards for the first valid u64
     parts.iter().rev().find_map(|s| s.parse::<u64>().ok())
 }
 
@@ -150,11 +191,21 @@ fn udp6_proc_line_matches_flow(
     if quad_matches_flow_v6(local, remote, meta) {
         return true;
     }
+
     if remote.0.is_unspecified() && remote.1 == 0 {
         let s = (meta.src, meta.src_port);
         let d = (meta.dst, meta.dst_port);
-        return local == s || local == d;
+
+        if local == s || local == d {
+            return true;
+        }
+
+        // WILDCARD MATCH: App bound to :: (unspecified). Just check the ports!
+        if local.0.is_unspecified() {
+            return local.1 == s.1 || local.1 == d.1;
+        }
     }
+    
     false
 }
 

@@ -1,36 +1,146 @@
 @startuml
-title IPC Network Monitor - Snapshot Export Sequence
+title IPC Network Monitor - Sequences (Extended)
 
 skinparam shadowing false
 
-actor Operator
-participant "kernel-spy" as kernel_spy
-participant "kernel-spy-ebpf" as kernel_spy_ebpf
-participant "Unix export socket" as export_socket
-participant "collector / ui" as export_client
-participant "ctl client" as ctl_client
-participant "Unix control socket" as control_socket
+' Sequence 1: Startup with Probe Fallback
+autonumber
+participant Operator as op
+participant kernel_spy as ks
+participant "eBPF/XDP" as xdp
+participant "eBPF/TC" as tc
+participant "RPC Socket" as rpc_sock
 
-Operator -> kernel_spy : start daemon on interface
-kernel_spy -> kernel_spy_ebpf : load and attach XDP / TC programs
-kernel_spy -> export_socket : bind /tmp/ipc-netmon.sock
-kernel_spy -> control_socket : bind /tmp/ipc-netmon-ctl.sock
+op -> ks : start kernel-spy -i eth0
+ks -> xdp : attach XDP_DRV mode
+xdp -->x ks : FAIL (unsupported)
+note right of ks: XDP_DRV failed\ntry SKB mode
+ks -> xdp : attach XDP_SKB mode
+xdp --> ks : SUCCESS
+ks -> tc : attach TC egress
+tc --> ks : SUCCESS
+ks -> rpc_sock : bind /tmp/ipc-netmon-ctl.sock
+ks --> op : ready (degradation log: XDP_DRV failed)
 
-opt operator control action
-  ctl_client -> control_socket : send JSON RPC request (e.g. ping/session_dump/nft_*)
-  control_socket -> kernel_spy : dispatch method
-  kernel_spy --> control_socket : JSON RPC result
-  control_socket --> ctl_client : one-line JSON response
+' Sequence 2: Flow Correlation with ss Enrichment
+autonumber
+participant "eBPF Maps" as maps
+participant "Inode Cache" as inode
+participant "ss(8)" as ss_cmd
+participant "User Cache" as uc
+
+maps -> inode : packet from eth0
+ks -> inode : rebuild /proc/*/fd cache
+inode -> inode : scan /proc/net/{tcp,udp}
+inode -> uc : lookup UID→username
+ks -> ss_cmd : (if --ss-enrich) query socket state
+ss_cmd --> ks : enriched metadata
+ks -> uc : resolve via /etc/passwd
+uc --> ks : uid=1000 username=alice
+
+' Sequence 3: Alert Generation
+autonumber
+participant "Alert Engine" as alert
+participant "Snapshot" as snap
+participant "Export Socket" as export
+
+alert -> snap : read rx.bytes
+alert -> alert : compute delta vs prev
+alt delta >= threshold
+  alert -> snap : append AlertEvent
+end
+snap -> export : write JSON line with alerts
+
+' Sequence 4: Policy Apply with Backup & Audit
+autonumber
+participant "RPC Client" as rpc_cli
+participant "Policy Engine" as pol
+participant "nftables" as nft
+participant "Audit Log" as aud
+
+rpc_cli -> rpc_sock : {"method":"nft_apply_drop","params":{"dst":"8.8.8.8"}}
+pol -> nft : list current table
+pol -> pol : save to /tmp/ipc-netmon-state/backup-T.json
+pol -> nft : add rule inet ipc_netmon ip daddr 8.8.8.8 drop
+alt apply succeeds
+  pol -> aud : log success action=nft_apply_drop
+  pol --> rpc_cli : {"ok":true,"data":{"backup":"..."}}
+else apply fails
+  pol -> nft : restore from backup
+  pol -> aud : log failure action=nft_apply_drop
+  pol --> rpc_cli : {"ok":false,"error":"..."}
 end
 
-export_client -> export_socket : connect once
+' Sequence 5: Policy Rollback
+autonumber
+participant "Operator (UI)" as op2
+participant "Rollback Handler" as rb
+participant "nftables State" as nft_state
 
-loop each snapshot interval
-  kernel_spy_ebpf --> kernel_spy : send flow stats and counters
-  kernel_spy -> kernel_spy : aggregate MonitorSnapshotV1
-  kernel_spy -> export_socket : write one JSON line
-  export_socket --> export_client : ExportLine or legacy snapshot JSON
-  export_client -> export_client : parse_export_line()
+op2 -> rpc_sock : {"method":"nft_rollback","params":{"policy_id":1}}
+rb -> rb : load backup /tmp/ipc-netmon-state/backup-T.json
+rb -> nft_state : flush table
+rb -> nft_state : restore from backup JSON
+rb -> aud : log action=nft_rollback outcome=success
+rb --> op2 : {"ok":true}
+
+' Sequence 6: Session Dump Export
+autonumber
+participant "Session Ring" as ring
+participant "RPC Dispatcher" as disp
+
+rpc_cli -> disp : {"method":"session_dump_file","params":{"path":"/tmp/session.json"}}
+disp -> ring : dump() all 120 snapshots
+ring --> disp : Vec<MonitorSnapshotV1>
+disp -> disp : write JSON array to /tmp/session.json
+disp -> aud : log action=session_dump_file
+disp --> rpc_cli : {"ok":true,"data":{"written":"/tmp/session.json"}}
+
+' Sequence 7: UI Error Handling & Reconnection
+autonumber
+participant "UI" as ui_app
+participant "Export Socket" as export_sock
+participant "Connection Loop" as conn
+
+ui_app -> export_sock : connect
+export_sock --> ui_app : OK, connected
+conn -> export_sock : read JSON line
+export_sock --> conn : {"schema_version":2,...}
+conn -> conn : parse & display
+loop every 1 second
+  conn -> export_sock : read JSON line
 end
+
+opt kernel-spy crashes
+  export_sock -->x conn : EOF
+  conn -> conn : show error "Connection closed"
+  conn -> conn : sleep 1s, backoff
+  conn -> export_sock : reconnect attempt
+  alt kernel-spy still down
+    export_sock -->x conn : Connection refused
+    conn -> conn : sleep 2s, backoff
+  else kernel-spy restarted
+    export_sock --> conn : OK, connected
+    conn -> conn : resume
+  end
+end
+
+' Sequence 8: CSV Export from Snapshots
+autonumber
+participant "UI Export" as exp
+participant "CSV Formatter" as csv_fmt
+participant "File System" as fs
+
+exp -> exp : collect 120 snapshots from ring buffer
+exp -> csv_fmt : convert flows to CSV
+csv_fmt -> csv_fmt : header: timestamp,src_ip,dst_ip,...
+csv_fmt -> csv_fmt : rows: per flow
+csv_fmt --> exp : CSV string
+exp -> fs : write flows.csv
+exp -> csv_fmt : convert processes to CSV
+csv_fmt --> exp : CSV string
+exp -> fs : write processes.csv
+exp -> exp : aggregate stats.json
+exp --> ui_app : {"ok":true,"files":["flows.csv","processes.csv",...]}
 
 @enduml

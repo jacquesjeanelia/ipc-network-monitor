@@ -107,6 +107,8 @@ mod tests {
             pid,
             comm: None,
             bytes_total: bytes,
+            ts_unix_ms: 0,
+            share_percent: 0.0,
         }
     }
 

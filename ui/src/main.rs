@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText, Ui};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 
-use common::{AlertEvent, FlowRow, MonitorSnapshotV1, parse_export_line};
+use common::{AlertEvent, FlowRow, MonitorSnapshotV1, ProcessTrafficRow, UserTrafficRow, parse_export_line};
 
 const HISTORY_CAP: usize = 120;
+const RECENT_SIGHTINGS_CAP: usize = 64;
 const EXPORT_SOCK: &str = "/tmp/ipc-netmon.sock";
 const CONTROL_SOCK: &str = "/tmp/ipc-netmon-ctl.sock";
 const MAX_ALERT_LOG: usize = 500;
@@ -46,10 +47,22 @@ fn fmt_ts_ms(ts_ms: u64) -> String {
     format!("{h:02}:{m:02}:{s:02} UTC")
 }
 
+fn fmt_pid_user(pid: Option<u32>, uid: Option<u32>, username: Option<&str>) -> String {
+    match (pid, uid, username) {
+        (Some(p), Some(u), Some(name)) => format!("pid={p} uid={u} {name}"),
+        (Some(p), Some(u), None) => format!("pid={p} uid={u}"),
+        (Some(p), None, Some(name)) => format!("pid={p} {name}"),
+        (Some(p), None, None) => format!("pid={p}"),
+        _ => "—".to_string(),
+    }
+}
+
 //shared state (background thread -> GUI) 
 
 struct SharedState {
     snapshot: Option<MonitorSnapshotV1>,
+    recent_process_sightings: VecDeque<ProcessTrafficRow>,
+    recent_user_sightings: VecDeque<UserTrafficRow>,
     rx_rate_history: VecDeque<[f64; 2]>, // [elapsed_secs, bytes/s]
     tx_rate_history: VecDeque<[f64; 2]>,
     prev_rx_bytes: Option<u64>,
@@ -65,6 +78,8 @@ impl SharedState {
     fn new() -> Self {
         Self {
             snapshot: None,
+            recent_process_sightings: VecDeque::new(),
+            recent_user_sightings: VecDeque::new(),
             rx_rate_history: VecDeque::new(),
             tx_rate_history: VecDeque::new(),
             prev_rx_bytes: None,
@@ -74,6 +89,34 @@ impl SharedState {
             connected: false,
             alert_log: Vec::new(),
             rpc_result: String::new(),
+        }
+    }
+
+    fn remember_process_sighting(&mut self, row: &ProcessTrafficRow) {
+        if let Some(pos) = self
+            .recent_process_sightings
+            .iter()
+            .position(|existing| existing.pid == row.pid)
+        {
+            self.recent_process_sightings.remove(pos);
+        }
+        self.recent_process_sightings.push_front(row.clone());
+        while self.recent_process_sightings.len() > RECENT_SIGHTINGS_CAP {
+            self.recent_process_sightings.pop_back();
+        }
+    }
+
+    fn remember_user_sighting(&mut self, row: &UserTrafficRow) {
+        if let Some(pos) = self
+            .recent_user_sightings
+            .iter()
+            .position(|existing| existing.uid == row.uid)
+        {
+            self.recent_user_sightings.remove(pos);
+        }
+        self.recent_user_sightings.push_front(row.clone());
+        while self.recent_user_sightings.len() > RECENT_SIGHTINGS_CAP {
+            self.recent_user_sightings.pop_back();
         }
     }
 
@@ -102,6 +145,13 @@ impl SharedState {
         self.prev_tx_bytes = Some(snap.tx.bytes);
         self.prev_ts_ms = Some(snap.ts_unix_ms);
 
+        for row in &snap.aggregates_by_pid {
+            self.remember_process_sighting(row);
+        }
+        for row in &snap.aggregates_by_user {
+            self.remember_user_sighting(row);
+        }
+
         for alert in &snap.alerts {
             if self.alert_log.len() >= MAX_ALERT_LOG {
                 self.alert_log.remove(0);
@@ -117,10 +167,9 @@ impl SharedState {
 #[derive(PartialEq)]
 enum Tab {
     Dashboard,
-    Flows,
-    Aggregates,
-    Alerts,
+    Correlation,
     Control,
+    Audit,
 }
 
 struct App {
@@ -172,7 +221,7 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(500));
 
         // Pull a snapshot of all state we need for rendering
-        let (connected, snap, rx_hist, tx_hist, alert_log, rpc_result) = {
+        let (connected, snap, rx_hist, tx_hist, alert_log, rpc_result, recent_process_sightings, recent_user_sightings) = {
             let s = self.state.lock().unwrap();
             (
                 s.connected,
@@ -181,6 +230,8 @@ impl eframe::App for App {
                 s.tx_rate_history.iter().cloned().collect::<Vec<_>>(),
                 s.alert_log.clone(),
                 s.rpc_result.clone(),
+                s.recent_process_sightings.iter().cloned().collect::<Vec<_>>(),
+                s.recent_user_sightings.iter().cloned().collect::<Vec<_>>(),
             )
         };
 
@@ -207,9 +258,8 @@ impl eframe::App for App {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     tab_btn(ui, "Control", &mut self.active_tab, Tab::Control);
-                    tab_btn(ui, "Alerts", &mut self.active_tab, Tab::Alerts);
-                    tab_btn(ui, "Aggregates", &mut self.active_tab, Tab::Aggregates);
-                    tab_btn(ui, "Flows", &mut self.active_tab, Tab::Flows);
+                    tab_btn(ui, "Audit", &mut self.active_tab, Tab::Audit);
+                    tab_btn(ui, "Correlation", &mut self.active_tab, Tab::Correlation);
                     tab_btn(ui, "Dashboard", &mut self.active_tab, Tab::Dashboard);
                 });
             });
@@ -224,7 +274,7 @@ impl eframe::App for App {
                         format!("⚠ {} alert(s) fired this session", alert_log.len()),
                     );
                     if ui.small_button("View all").clicked() {
-                        self.active_tab = Tab::Alerts;
+                        self.active_tab = Tab::Audit;
                     }
                 });
             });
@@ -233,9 +283,13 @@ impl eframe::App for App {
         // main content
         egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
             Tab::Dashboard => Self::show_dashboard(ui, snap.as_ref(), &rx_hist, &tx_hist),
-            Tab::Flows => Self::show_flows(ui, snap.as_ref()),
-            Tab::Aggregates => Self::show_aggregates(ui, snap.as_ref()),
-            Tab::Alerts => Self::show_alerts(ui, &alert_log),
+            Tab::Correlation => Self::show_correlation(
+                ui,
+                snap.as_ref(),
+                &recent_process_sightings,
+                &recent_user_sightings,
+            ),
+            Tab::Audit => Self::show_audit(ui, snap.as_ref(), &alert_log),
             Tab::Control => self.show_control(ui, &rpc_result),
         });
     }
@@ -385,20 +439,136 @@ impl App {
     }
 }
 
-// Flows tab
+// Correlation tab
 
 impl App {
-    fn show_flows(ui: &mut Ui, snap: Option<&MonitorSnapshotV1>) {
+    fn show_correlation(
+        ui: &mut Ui,
+        snap: Option<&MonitorSnapshotV1>,
+        recent_process_sightings: &[ProcessTrafficRow],
+        recent_user_sightings: &[UserTrafficRow],
+    ) {
         let Some(snap) = snap else {
             ui.label("No data yet.");
             return;
         };
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Correlation View");
+            ui.colored_label(
+                Color32::GRAY,
+                "This view will drill from flows to processes, users, and socket attribution.",
+            );
+            ui.add_space(8.0);
+
+            // ui.group(|ui| {
+            //     ui.label(RichText::new("Focus").strong());
+            //     ui.label(format!("Interface: {}", snap.iface));
+            //     ui.label(format!("Session: {}", snap.session.session_id));
+            //     ui.label(format!("Latest snapshot: {}", fmt_ts_ms(snap.ts_unix_ms)));
+            // });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.heading("Process and User Correlation");
+            ui.label("This is the skeleton area for process/user drill-downs and inode attribution.");
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Recent Process Sightings").strong());
+                    if recent_process_sightings.is_empty() {
+                        ui.colored_label(Color32::GRAY, "No recent process sightings yet.");
+                    } else {
+                        for row in recent_process_sightings.iter().take(12) {
+                            ui.label(format!(
+                                "{} pid={} {} ({})",
+                                fmt_ts_ms(row.ts_unix_ms),
+                                row.pid,
+                                row.comm.as_deref().unwrap_or("—"),
+                                fmt_bytes(row.bytes_total)
+                            ));
+                        }
+                    }
+                });
+                ui.add_space(24.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Recent User Sightings").strong());
+                    if recent_user_sightings.is_empty() {
+                        ui.colored_label(Color32::GRAY, "No recent user sightings yet.");
+                    } else {
+                        for row in recent_user_sightings.iter().take(12) {
+                            ui.label(format!(
+                                "{} uid={} {} ({})",
+                                fmt_ts_ms(row.ts_unix_ms),
+                                row.uid,
+                                row.username.as_deref().unwrap_or("—"),
+                                fmt_bytes(row.bytes_total)
+                            ));
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Top Processes").strong());
+                    if snap.aggregates_by_pid.is_empty() {
+                        ui.colored_label(Color32::GRAY, "No process attribution yet.");
+                    } else {
+                        for row in snap.aggregates_by_pid.iter().take(10) {
+                            ui.label(format!("pid={} {} {} ({})", row.pid, format!("{:.1}%", row.share_percent), row.comm.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
+                        }
+                    }
+                });
+                ui.add_space(24.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Top Users").strong());
+                    if snap.aggregates_by_user.is_empty() {
+                        ui.colored_label(Color32::GRAY, "No user attribution yet.");
+                    } else {
+                        for row in snap.aggregates_by_user.iter().take(10) {
+                            ui.label(format!("uid={} {} {} ({})", row.uid, format!("{:.1}%", row.share_percent), row.username.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
             ui.heading(format!("RX Flows — {} entries", snap.flows_rx.len()));
             flow_table(ui, &snap.flows_rx, "rx_tbl");
             ui.add_space(16.0);
             ui.heading(format!("TX Flows — {} entries", snap.flows_tx.len()));
             flow_table(ui, &snap.flows_tx, "tx_tbl");
+            
+            /* Aggregate History */
+            ui.add_space(12.0);
+            ui.separator();
+            ui.heading("Aggregate History (recent)");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Recent Process Aggregates").strong());
+                    if snap.aggregate_history_by_pid.is_empty() {
+                        ui.colored_label(Color32::GRAY, "No historical aggregates yet.");
+                    } else {
+                        for row in snap.aggregate_history_by_pid.iter().take(12) {
+                            ui.label(format!("{} {} pid={} {} ({})", fmt_ts_ms(row.ts_unix_ms), format!("{:.1}%", row.share_percent), row.pid, row.comm.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
+                        }
+                    }
+                });
+                ui.add_space(24.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Recent User Aggregates").strong());
+                    if snap.aggregate_history_by_user.is_empty() {
+                        ui.colored_label(Color32::GRAY, "No historical aggregates yet.");
+                    } else {
+                        for row in snap.aggregate_history_by_user.iter().take(12) {
+                            ui.label(format!("{} {} uid={} {} ({})", fmt_ts_ms(row.ts_unix_ms), format!("{:.1}%", row.share_percent), row.uid, row.username.as_deref().unwrap_or("—"), fmt_bytes(row.bytes_total)));
+                        }
+                    }
+                });
+            });
         });
     }
 }
@@ -409,11 +579,11 @@ fn flow_table(ui: &mut Ui, rows: &[FlowRow], id: &str) {
         .striped(true)
         .min_col_width(90.0)
         .show(ui, |ui| {
-            ui.label(RichText::new("Src IP").strong());
-            ui.label(RichText::new("Src Port").strong());
-            ui.label(RichText::new("Dst IP").strong());
-            ui.label(RichText::new("Dst Port").strong());
-            ui.label(RichText::new("Proto").strong());
+            ui.label(RichText::new("Source IP").strong());
+            ui.label(RichText::new("Source Port").strong());
+            ui.label(RichText::new("Destination IP").strong());
+            ui.label(RichText::new("Destination Port").strong());
+            ui.label(RichText::new("Protocol").strong());
             ui.label(RichText::new("Bytes").strong());
             ui.label(RichText::new("PID / User").strong());
             ui.end_row();
@@ -429,14 +599,14 @@ fn flow_table(ui: &mut Ui, rows: &[FlowRow], id: &str) {
                     "ICMP" => Color32::from_rgb(0xcc, 0x88, 0xff),
                     _      => Color32::GRAY,
                 };
-                ui.colored_label(proto_color, &row.protocol);
-                ui.label(fmt_bytes(row.bytes));
-                let pid_user = match (row.local_pid, row.local_username.as_deref()) {
-                    (Some(p), Some(u)) => format!("{p} ({u})"),
-                    (Some(p), None)    => p.to_string(),
-                    _                  => "—".to_string(),
+                let proto_label = if row.protocol == "Other" {
+                    "Other (unsupported protocol)"
+                } else {
+                    &row.protocol
                 };
-                ui.label(pid_user);
+                ui.colored_label(proto_color, proto_label);
+                ui.label(fmt_bytes(row.bytes));
+                ui.label(fmt_pid_user(row.local_pid, row.local_uid, row.local_username.as_deref()));
                 ui.end_row();
             }
         });
@@ -445,107 +615,63 @@ fn flow_table(ui: &mut Ui, rows: &[FlowRow], id: &str) {
     }
 }
 
-// Aggregates tab
+// Audit tab
 
 impl App {
-    fn show_aggregates(ui: &mut Ui, snap: Option<&MonitorSnapshotV1>) {
+    fn show_audit(ui: &mut Ui, snap: Option<&MonitorSnapshotV1>, alert_log: &[AlertEvent]) {
         let Some(snap) = snap else {
             ui.label("No data yet.");
             return;
         };
         egui::ScrollArea::vertical().show(ui, |ui| {
-            //by PID 
-            ui.heading(format!("By Process — {} entries", snap.aggregates_by_pid.len()));
-
-            if !snap.aggregates_by_pid.is_empty() {
-                let max = snap.aggregates_by_pid[0].bytes_total as f64;
-                egui::Grid::new("pid_grid")
-                    .num_columns(4)
-                    .striped(true)
-                    .min_col_width(80.0)
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("PID").strong());
-                        ui.label(RichText::new("Command").strong());
-                        ui.label(RichText::new("Total Traffic").strong());
-                        ui.label(RichText::new("Share").strong());
-                        ui.end_row();
-                        for r in &snap.aggregates_by_pid {
-                            ui.label(r.pid.to_string());
-                            ui.label(r.comm.as_deref().unwrap_or("—"));
-                            ui.label(fmt_bytes(r.bytes_total));
-                            let pct = if max > 0.0 { r.bytes_total as f64 / max * 100.0 } else { 0.0 };
-                            ui.label(format!("{pct:.1}%"));
-                            ui.end_row();
-                        }
-                    });
-            } else {
-                ui.colored_label(Color32::GRAY, "  (no PID data — enable --proc-pid-correlation)");
-            }
-
-            ui.add_space(16.0);
-
-            //by user 
-            ui.heading(format!("By User — {} entries", snap.aggregates_by_user.len()));
-            if !snap.aggregates_by_user.is_empty() {
-                let max = snap.aggregates_by_user[0].bytes_total as f64;
-                egui::Grid::new("user_grid")
-                    .num_columns(4)
-                    .striped(true)
-                    .min_col_width(80.0)
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("UID").strong());
-                        ui.label(RichText::new("Username").strong());
-                        ui.label(RichText::new("Total Traffic").strong());
-                        ui.label(RichText::new("Share").strong());
-                        ui.end_row();
-                        for r in &snap.aggregates_by_user {
-                            ui.label(r.uid.to_string());
-                            ui.label(r.username.as_deref().unwrap_or("—"));
-                            ui.label(fmt_bytes(r.bytes_total));
-                            let pct = if max > 0.0 { r.bytes_total as f64 / max * 100.0 } else { 0.0 };
-                            ui.label(format!("{pct:.1}%"));
-                            ui.end_row();
-                        }
-                    });
-            } else {
-                ui.colored_label(Color32::GRAY, "  (no UID data — enable --proc-pid-correlation)");
-            }
-        });
-    }
-}
-
-//  Alerts tab 
-
-impl App {
-    fn show_alerts(ui: &mut Ui, alert_log: &[AlertEvent]) {
-        ui.heading(format!("Alert Log — {} events", alert_log.len()));
-        ui.add_space(4.0);
-        if alert_log.is_empty() {
-            ui.colored_label(Color32::GRAY, "No alerts fired yet.");
+            ui.heading("Audit View");
+            ui.colored_label(
+                Color32::GRAY,
+                "This view will eventually merge control RPC audit logs with alert history and probe errors.",
+            );
             ui.add_space(8.0);
-            ui.label("Tip: start kernel-spy with alert flags to arm thresholds, e.g.:");
-            ui.code("  --alert-rx-bytes-per-tick 1000000  --alert-top-pid-bytes 5000000");
-            return;
-        }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("alert_log_grid")
-                .num_columns(4)
-                .striped(true)
-                .min_col_width(80.0)
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Time (UTC)").strong());
-                    ui.label(RichText::new("Severity").strong());
-                    ui.label(RichText::new("Kind").strong());
-                    ui.label(RichText::new("Message").strong());
-                    ui.end_row();
-                    for a in alert_log.iter().rev() {
-                        ui.label(fmt_ts_ms(a.ts_unix_ms));
-                        ui.colored_label(alert_color(&a.severity), &a.severity);
-                        ui.label(&a.kind);
-                        ui.label(&a.message);
+
+            ui.group(|ui| {
+                ui.label(RichText::new("Current Session").strong());
+                ui.label(format!("Session ID: {}", snap.session.session_id));
+                ui.label(format!("Snapshot time: {}", fmt_ts_ms(snap.ts_unix_ms)));
+                ui.label(format!("Probe errors: {}", snap.probe_status.errors.len()));
+            });
+
+            ui.add_space(12.0);
+
+            ui.heading("Alerts from current session");
+            if alert_log.is_empty() {
+                ui.colored_label(Color32::GRAY, "No alerts recorded yet.");
+            } else {
+                egui::Grid::new("audit_alert_grid")
+                    .num_columns(4)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Time").strong());
+                        ui.label(RichText::new("Severity").strong());
+                        ui.label(RichText::new("Kind").strong());
+                        ui.label(RichText::new("Message").strong());
                         ui.end_row();
-                    }
-                });
+                        for a in alert_log.iter().rev().take(50) {
+                            ui.label(fmt_ts_ms(a.ts_unix_ms));
+                            ui.colored_label(alert_color(&a.severity), &a.severity);
+                            ui.label(&a.kind);
+                            ui.label(&a.message);
+                            ui.end_row();
+                        }
+                    });
+            }
+
+            ui.add_space(12.0);
+            ui.heading("Probe errors");
+            if snap.probe_status.errors.is_empty() {
+                ui.colored_label(Color32::GREEN, "No probe errors reported.");
+            } else {
+                for err in &snap.probe_status.errors {
+                    ui.colored_label(Color32::YELLOW, format!("⚠ {err}"));
+                }
+            }
         });
     }
 }

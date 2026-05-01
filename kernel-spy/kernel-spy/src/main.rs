@@ -41,10 +41,25 @@ fn xdp_flags_from_str(s: &str) -> anyhow::Result<XdpFlags> {
         "skb" | "skb_mode" => Ok(XdpFlags::SKB_MODE),
         "drv" | "drv_mode" | "driver" => Ok(XdpFlags::DRV_MODE),
         "hw" | "hw_mode" => Ok(XdpFlags::HW_MODE),
-        "generic" | "gen" => Ok(XdpFlags::SKB_MODE),
+        "generic" | "gen" => Ok(XdpFlags::empty()),
         "empty" | "none" | "default" => Ok(XdpFlags::empty()),
         _ => anyhow::bail!("unknown --xdp-mode {s} (try skb, drv, hw, generic, empty)"),
     }
+}
+
+fn xdp_attach_order(mode: &str) -> anyhow::Result<Vec<(&'static str, XdpFlags)>> {
+    let order = match mode.to_lowercase().as_str() {
+        "drv" | "drv_mode" | "driver" => vec!["drv", "skb", "generic"],
+        "skb" | "skb_mode" => vec!["skb", "generic", "drv"],
+        "hw" | "hw_mode" => vec!["hw", "drv", "skb", "generic"],
+        "generic" | "gen" | "empty" | "none" | "default" => vec!["generic", "skb", "drv"],
+        _ => anyhow::bail!("unknown --xdp-mode {mode} (try skb, drv, hw, generic, empty)"),
+    };
+
+    order
+        .into_iter()
+        .map(|name| Ok((name, xdp_flags_from_str(name)?)))
+        .collect()
 }
 
 fn protocol_name(p: u8) -> &'static str {
@@ -52,6 +67,7 @@ fn protocol_name(p: u8) -> &'static str {
         6 => "TCP",
         17 => "UDP",
         1 => "ICMP",
+        2 => "IGMP",
         _ => "Other",
     }
 }
@@ -183,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .and_then(|f| f.seed_demo_blocklist)
             .unwrap_or(false);
+    let force_attach_fail = std::env::var_os("KSPY_FORCE_ATTACH_FAIL").is_some();
 
     let audit_path = cli
         .audit_log
@@ -230,28 +247,64 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let xdp_flags = xdp_flags_from_str(&xdp_mode)?;
-    let program: &mut Xdp = ebpf.program_mut("kernel_spy").unwrap().try_into()?;
-    program.load()?;
-    program
-        .attach(&iface, xdp_flags)
-        .with_context(|| {
-            format!(
-                "attach XDP on interface {iface:?} - unknown or wrong name; use exact name from `ip -br link` or `ls /sys/class/net/` (try `-i lo` to smoke-test)"
-            )
-        })?;
-    log::info!("Attached XDP to ingress of {}", iface);
-
-    let _ = qdisc_add_clsact(&iface);
-    let tc_program: &mut SchedClassifier = ebpf.program_mut("kernel_spy_tc").unwrap().try_into()?;
-    tc_program.load()?;
-    tc_program
-        .attach(&iface, TcAttachType::Egress)
-        .with_context(|| format!("attach TC egress on interface {iface:?}"))?;
-    log::info!("Attached TC egress classifier on {}", iface);
-
-    let mut tcp_retransmit_trace_attached = false;
     let mut probe_errors: Vec<String> = Vec::new();
+    let mut xdp_attached = false;
+    let mut tc_egress_attached = false;
+    let mut tcp_retransmit_trace_attached = false;
+
+    if force_attach_fail {
+        probe_errors.push("forced attach failure via KSPY_FORCE_ATTACH_FAIL".into());
+    } else {
+        let xdp_attempts = xdp_attach_order(&xdp_mode)?;
+        match ebpf.program_mut("kernel_spy") {
+            Some(program) => {
+                let program: &mut Xdp = program.try_into()?;
+                program.load()?;
+                for (mode_name, flags) in xdp_attempts {
+                    match program.attach(&iface, flags) {
+                        Ok(_link_id) => {
+                            xdp_attached = true;
+                            log::info!("Attached XDP ({mode_name}) to ingress of {}", iface);
+                            break;
+                        }
+                        Err(e) => {
+                            probe_errors.push(format!("XDP {mode_name} attach failed: {e:#}"));
+                            warn!("XDP {mode_name} attach failed (degraded): {e:#}");
+                        }
+                    }
+                }
+                if !xdp_attached {
+                    probe_errors.push("XDP attach failed in all fallback modes; running degraded".into());
+                }
+            }
+            None => {
+                probe_errors.push("XDP program lookup failed: program kernel_spy not found".into());
+                warn!("XDP program lookup failed (degraded): program kernel_spy not found");
+            }
+        }
+
+        let _ = qdisc_add_clsact(&iface);
+        match ebpf.program_mut("kernel_spy_tc") {
+            Some(program) => {
+                let tc_program: &mut SchedClassifier = program.try_into()?;
+                tc_program.load()?;
+                match tc_program.attach(&iface, TcAttachType::Egress) {
+                    Ok(_link_id) => {
+                        tc_egress_attached = true;
+                        log::info!("Attached TC egress classifier on {}", iface);
+                    }
+                    Err(e) => {
+                        probe_errors.push(format!("TC egress attach failed: {e:#}"));
+                        warn!("TC egress attach failed (degraded): {e:#}");
+                    }
+                }
+            }
+            None => {
+                probe_errors.push("TC program lookup failed: program kernel_spy_tc not found".into());
+                warn!("TC program lookup failed (degraded): program kernel_spy_tc not found");
+            }
+        }
+    }
 
     if !skip_tcp_retransmit_trace {
         let r: anyhow::Result<()> = (|| {
@@ -337,15 +390,6 @@ async fn main() -> anyhow::Result<()> {
         probe_errors.push("nft: binary not found in PATH".into());
     }
 
-    let probe_status_snapshot = ProbeStatus {
-        xdp_attached: true,
-        tc_egress_attached: true,
-        tcp_retransmit_trace_attached,
-        cgroup_pid_hooks_attached: false, // legacy field: cgroup BPF PID path not used (proc + ss)
-        nftables_ready: nft_ready,
-        errors: probe_errors,
-    };
-
     let mut netem_applied = false;
     if let Some(ref fc) = file_cfg {
         if let Some(ms) = fc.netem_delay_ms {
@@ -361,17 +405,40 @@ async fn main() -> anyhow::Result<()> {
                     ms
                 );
             }
-            tc_control::apply_root_netem_delay_ms(&iface, ms)?;
-            netem_applied = true;
-            control::audit(
-                audit_path.as_deref(),
-                "tc_netem",
-                &format!("applied netem delay {ms}ms on {}", iface),
-                Some("success"),
-                Some(session_id.as_str()),
-            )?;
+            match tc_control::apply_root_netem_delay_ms(&iface, ms) {
+                Ok(()) => {
+                    netem_applied = true;
+                    control::audit(
+                        audit_path.as_deref(),
+                        "tc_netem",
+                        &format!("applied netem delay {ms}ms on {}", iface),
+                        Some("success"),
+                        Some(session_id.as_str()),
+                    )?;
+                }
+                Err(e) => {
+                    probe_errors.push(format!("tc netem apply: {e:#}"));
+                    warn!("tc netem apply failed (degraded): {e:#}");
+                    let _ = control::audit(
+                        audit_path.as_deref(),
+                        "tc_netem",
+                        &format!("failed netem delay {ms}ms on {} err={e:#}", iface),
+                        Some("failure"),
+                        Some(session_id.as_str()),
+                    );
+                }
+            }
         }
     }
+
+    let probe_status_snapshot = ProbeStatus {
+        xdp_attached,
+        tc_egress_attached,
+        tcp_retransmit_trace_attached,
+        cgroup_pid_hooks_attached: false, // legacy field: cgroup BPF PID path not used (proc + ss)
+        nftables_ready: nft_ready,
+        errors: probe_errors,
+    };
 
     let monitor_rx = Array::try_from(ebpf.map("MONITOR_RX_MAP").unwrap())?;
     let monitor_tx = Array::try_from(ebpf.map("MONITOR_TX_MAP").unwrap())?;
@@ -510,6 +577,9 @@ async fn main() -> anyhow::Result<()> {
     println!("=================================================");
     println!();
 
+    // Initialize aggregate history (keep last 100 snapshots)
+    let mut aggregate_history = aggregate::AggregateHistory::new(100);
+
     loop {
         let rx_totals = read_direction_totals(&monitor_rx);
         let tx_totals = read_direction_totals(&monitor_tx);
@@ -539,19 +609,29 @@ async fn main() -> anyhow::Result<()> {
 
         attr::enrich_flow_rows(&mut flows_rx);
         attr::enrich_flow_rows(&mut flows_tx);
-        if eff.ss_enrich {
+        let have_any_missing_pid = flows_rx
+            .iter()
+            .chain(flows_tx.iter())
+            .any(|row| row.local_pid.is_none());
+        if eff.ss_enrich || have_any_missing_pid {
             ss_enrich::enrich_flows_from_ss(&mut flows_rx, &mut flows_tx);
             attr::enrich_flow_rows(&mut flows_rx);
             attr::enrich_flow_rows(&mut flows_tx);
         }
 
-        let (aggregates_by_pid, aggregates_by_user) =
-            aggregate::aggregates_from_flows(&flows_rx, &flows_tx);
-
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+
+        // Calculate total bytes for percentage calculation
+        let total_bytes = rx_totals.bytes.saturating_add(tx_totals.bytes);
+
+        let (aggregates_by_pid, aggregates_by_user) =
+            aggregate::aggregates_from_flows(&flows_rx, &flows_tx, ts, total_bytes);
+
+        // Push current aggregates to history
+        aggregate_history.push(&aggregates_by_pid, &aggregates_by_user);
 
         let tick_alerts = alert_engine.evaluate(ts, &rx_totals, &aggregates_by_pid);
 
@@ -574,8 +654,10 @@ async fn main() -> anyhow::Result<()> {
                 session_id: session_id.clone(),
                 window_start_ms,
             },
-            aggregates_by_pid,
-            aggregates_by_user,
+            aggregates_by_pid: aggregates_by_pid.clone(),
+            aggregates_by_user: aggregates_by_user.clone(),
+            aggregate_history_by_pid: aggregate_history.pid_history().to_vec(),
+            aggregate_history_by_user: aggregate_history.uid_history().to_vec(),
             alerts: tick_alerts,
         };
 
@@ -621,14 +703,14 @@ async fn main() -> anyhow::Result<()> {
         );
         if let Some(top) = snapshot.aggregates_by_pid.first() {
             println!(
-                "         top talker (pid): pid={} bytes_total={} comm={:?}",
-                top.pid, top.bytes_total, top.comm
+                "         top talker (pid): pid={} bytes_total={} share={:.1}% comm={:?}",
+                top.pid, top.bytes_total, top.share_percent, top.comm
             );
         }
         if let Some(top) = snapshot.aggregates_by_user.first() {
             println!(
-                "         top talker (user): uid={} bytes_total={} name={:?}",
-                top.uid, top.bytes_total, top.username
+                "         top talker (user): uid={} bytes_total={} share={:.1}% name={:?}",
+                top.uid, top.bytes_total, top.share_percent, top.username
             );
         }
         println!(

@@ -105,6 +105,35 @@ fn backup_path(state_dir: &Path) -> PathBuf {
     state_dir.join("nft_ruleset_backup.nft")
 }
 
+fn list_table_text() -> anyhow::Result<String> {
+    let out = nft_cmd()
+        .args(["list", "table", TABLE_FAMILY, TABLE_NAME])
+        .output()
+        .context("nft list table")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "nft list table failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn restore_backup_if_needed(backup: &Path) {
+    if let Err(e) = rollback_from_file(backup) {
+        log::error!("rollback after apply failure also failed for {}: {e:#}", backup.display());
+    }
+}
+
+fn verify_rule_contains(expected: &str) -> anyhow::Result<()> {
+    let table = list_table_text()?;
+    if table.contains(expected) {
+        Ok(())
+    } else {
+        anyhow::bail!("applied nft rule was not present after verification: expected substring {expected:?}");
+    }
+}
+
 /// save current table text for rollback; write temp file then rename
 pub fn backup_table(state_dir: &Path) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(state_dir).context("create state dir")?;
@@ -173,7 +202,12 @@ pub fn apply_drop_ipv4(state_dir: &Path, dst: Ipv4Addr) -> anyhow::Result<PathBu
         .status()
         .context("nft add rule")?;
     if !st.success() {
+        restore_backup_if_needed(&backup);
         anyhow::bail!("nft add rule failed (exit {:?})", st.code());
+    }
+    if let Err(e) = verify_rule_contains(&format!("ip daddr {} drop", dst_s)) {
+        restore_backup_if_needed(&backup);
+        anyhow::bail!("nft drop verification failed: {e:#}");
     }
     Ok(backup)
 }
@@ -216,7 +250,12 @@ pub fn apply_drop_uid(state_dir: &Path, uid: u32) -> anyhow::Result<PathBuf> {
         .status()
         .context("nft add uid rule")?;
     if !st.success() {
+        restore_backup_if_needed(&backup);
         anyhow::bail!("nft add uid rule failed (exit {:?})", st.code());
+    }
+    if let Err(e) = verify_rule_contains(&format!("meta skuid {} drop", uid_s)) {
+        restore_backup_if_needed(&backup);
+        anyhow::bail!("nft uid verification failed: {e:#}");
     }
     Ok(backup)
 }
@@ -243,7 +282,12 @@ pub fn apply_drop_gid(state_dir: &Path, gid: u32) -> anyhow::Result<PathBuf> {
         .status()
         .context("nft add gid rule")?;
     if !st.success() {
+        restore_backup_if_needed(&backup);
         anyhow::bail!("nft add gid rule failed (exit {:?})", st.code());
+    }
+    if let Err(e) = verify_rule_contains(&format!("meta skgid {} drop", gid_s)) {
+        restore_backup_if_needed(&backup);
+        anyhow::bail!("nft gid verification failed: {e:#}");
     }
     Ok(backup)
 }
@@ -261,7 +305,7 @@ pub fn apply_rate_limit_ipv4(state_dir: &Path, dst: Ipv4Addr, rate: &str) -> any
         CHAIN_OUT.to_string(),
         "ip".to_string(),
         "daddr".to_string(),
-        dst_s,
+        dst_s.clone(),
         "limit".to_string(),
         "rate".to_string(),
         rate_s.to_string(),
@@ -276,7 +320,12 @@ pub fn apply_rate_limit_ipv4(state_dir: &Path, dst: Ipv4Addr, rate: &str) -> any
         .status()
         .context("nft add rate rule")?;
     if !st.success() {
+        restore_backup_if_needed(&backup);
         anyhow::bail!("nft add rate rule failed (exit {:?})", st.code());
+    }
+    if let Err(e) = verify_rule_contains(&format!("ip daddr {} limit rate {} drop", dst_s, rate_s)) {
+        restore_backup_if_needed(&backup);
+        anyhow::bail!("nft rate verification failed: {e:#}");
     }
     Ok(backup)
 }

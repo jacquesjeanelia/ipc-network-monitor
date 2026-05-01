@@ -125,6 +125,9 @@ fn flow_matches_ss(row: &FlowRow, ss: &SsRow) -> bool {
     let b = (&row.dst_ip, row.dst_port);
     let x = (&ss.local_ip, ss.local_port);
     let y = (&ss.remote_ip, ss.remote_port);
+    if want == 17 {
+        return a == x || b == x;
+    }
     a == x && b == y || a == y && b == x
 }
 
@@ -225,6 +228,30 @@ mod tests {
         assert_eq!(r.proto, 17);
         assert_eq!(r.local_port, 5353);
         assert_eq!(r.pid, None);
+    }
+
+    #[test]
+    fn udp_flow_matches_unconnected_ss_local_endpoint() {
+        let row = FlowRow {
+            src_ip: "10.40.57.100".into(),
+            dst_ip: "8.8.8.8".into(),
+            src_port: 45044,
+            dst_port: 53,
+            protocol: "UDP".into(),
+            bytes: 94,
+            local_pid: None,
+            local_uid: None,
+            local_username: None,
+        };
+        let ss = SsRow {
+            proto: 17,
+            local_ip: "10.40.57.100".into(),
+            local_port: 45044,
+            remote_ip: "0.0.0.0".into(),
+            remote_port: 0,
+            pid: Some(4242),
+        };
+        assert!(flow_matches_ss(&row, &ss));
     }
 
     #[test]
