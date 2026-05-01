@@ -311,6 +311,21 @@ pub fn pid_via_proc_socket(meta: &PacketMetadata, cache: &InodePidCache) -> Opti
     cache.pid_for_inode(inode)
 }
 
+/// Look up pid+comm from the eBPF SOCK_SPORT_PID map by src_port.
+/// Falls back gracefully if the entry is absent.
+pub fn pid_comm_from_ebpf_map<T: std::borrow::Borrow<aya::maps::MapData>>(
+    sport: u16,
+    map: &aya::maps::HashMap<T, u16, kernel_spy_common::PidComm>,
+) -> Option<(u32, String)> {
+    let entry = map.get(&sport, 0).ok()?;
+    if entry.pid == 0 {
+        return None;
+    }
+    let comm_end = entry.comm.iter().position(|&b| b == 0).unwrap_or(16);
+    let comm = String::from_utf8_lossy(&entry.comm[..comm_end]).into_owned();
+    Some((entry.pid, comm))
+}
+
 #[cfg(test)]
 mod tests {
     use kernel_spy_common::{PacketMetadata, PacketMetadataV6};

@@ -329,6 +329,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Try to attach inet_sock_set_state for short-lived process attribution
+    let r: anyhow::Result<()> = (|| {
+        let tp: &mut TracePoint = ebpf
+            .program_mut("sock_inet_sock_set_state")
+            .context("program sock_inet_sock_set_state")?
+            .try_into()?;
+        tp.load()?;
+        tp.attach("sock", "inet_sock_set_state")
+            .context("attach sock:inet_sock_set_state")?;
+        Ok(())
+    })();
+    match r {
+        Ok(()) => log::info!("Attached tracepoint sock:inet_sock_set_state (short-lived pid attribution)"),
+        Err(e) => {
+            probe_errors.push(format!("inet_sock_set_state tracepoint: {e:#}"));
+            warn!("sock:inet_sock_set_state attach failed (degraded): {e:#}");
+        }
+    }
+
     let mut block_ips_v4: Vec<Ipv4Addr> = Vec::new();
     let mut block_ips_v6: Vec<Ipv6Addr> = Vec::new();
     for ip in &cli.blocklist {
@@ -447,6 +466,8 @@ async fn main() -> anyhow::Result<()> {
     let ip6_rx = HashMap::try_from(ebpf.map("IP6_STATS_RX").unwrap())?;
     let ip6_tx = HashMap::try_from(ebpf.map("IP6_STATS_TX").unwrap())?;
     let health = Array::try_from(ebpf.map("HEALTH_COUNTERS").unwrap())?;
+    let sock_sport_pid: Option<aya::maps::HashMap<&aya::maps::MapData, u16, kernel_spy_common::PidComm>> =
+        ebpf.map("SOCK_SPORT_PID").and_then(|m| aya::maps::HashMap::try_from(m).ok());
 
     let (tx_broadcast, _) = broadcast::channel::<String>(8);
 
@@ -609,6 +630,21 @@ async fn main() -> anyhow::Result<()> {
 
         attr::enrich_flow_rows(&mut flows_rx);
         attr::enrich_flow_rows(&mut flows_tx);
+
+        // Enrich flows missing pid attribution from the eBPF sport→pid map (catches short-lived processes)
+        if let Some(ref smap) = sock_sport_pid {
+            for row in flows_rx.iter_mut().chain(flows_tx.iter_mut()) {
+                if row.local_pid.is_none() {
+                    if let Some((pid, comm)) = proc_corr::pid_comm_from_ebpf_map(row.src_port, smap) {
+                        row.local_pid = Some(pid);
+                        if row.local_username.is_none() {
+                            row.local_username = Some(comm);
+                        }
+                    }
+                }
+            }
+        }
+
         let have_any_missing_pid = flows_rx
             .iter()
             .chain(flows_tx.iter())

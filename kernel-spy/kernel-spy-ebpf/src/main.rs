@@ -8,8 +8,10 @@ use aya_ebpf::{
     maps::HashMap,
     programs::{TcContext, TracePointContext, XdpContext},
 };
+use aya_ebpf::helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid};
 use kernel_spy_common::{
     BlocklistIpv6Key, FlowMapCapacity, HealthCounterIndex, PacketMetadata, PacketMetadataV6,
+    PidComm,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -61,6 +63,11 @@ static BLOCKLIST6_MAP: HashMap<BlocklistIpv6Key, u8> =
 /// health counters; indices match [`HealthCounterIndex`] in userspace
 #[map]
 static HEALTH_COUNTERS: Array<u64> = Array::with_max_entries(8, 0);
+
+/// sport (host byte order) → pid+comm recorded when TCP reaches ESTABLISHED
+/// lets userspace attribute short-lived processes that exit before /proc scan
+#[map]
+static SOCK_SPORT_PID: HashMap<u16, PidComm> = HashMap::with_max_entries(4096, 0);
 
 #[inline(always)]
 fn health_add(idx: u32, delta: u64) {
@@ -449,6 +456,34 @@ pub fn kernel_spy_tc(ctx: TcContext) -> i32 {
 pub fn tcp_tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
     let _ = ctx;
     health_add(HealthCounterIndex::TcpRetransmitSkb.idx(), 1);
+    0
+}
+
+/// `sock:inet_sock_set_state` — record pid+comm when TCP reaches ESTABLISHED (newstate==1)
+/// Format offsets (stable since Linux 4.16):
+///   offset 16: oldstate (i32), offset 20: newstate (i32), offset 24: sport (u16)
+#[tracepoint(category = "sock", name = "inet_sock_set_state")]
+pub fn sock_inet_sock_set_state(ctx: TracePointContext) -> u32 {
+    let newstate: i32 = match unsafe { ctx.read_at(20) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    // TCP_ESTABLISHED == 1
+    if newstate != 1 {
+        return 0;
+    }
+    let sport: u16 = match unsafe { ctx.read_at(24) } {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let pid_tgid = unsafe { bpf_get_current_pid_tgid() };
+    let pid = (pid_tgid >> 32) as u32;
+    if pid == 0 {
+        return 0;
+    }
+    let comm = unsafe { bpf_get_current_comm() }.unwrap_or([0u8; 16]);
+    let entry = PidComm::new(pid, comm);
+    let _ = SOCK_SPORT_PID.insert(&sport, &entry, 0);
     0
 }
 

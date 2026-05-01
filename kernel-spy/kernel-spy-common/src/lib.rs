@@ -99,6 +99,21 @@ impl HealthCounterIndex {
     }
 }
 
+/// pid + process name, stored in SOCK_SPORT_PID keyed by src port
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct PidComm {
+    pub pid: u32,
+    _pad: u32,
+    pub comm: [u8; 16],
+}
+
+impl PidComm {
+    pub const fn new(pid: u32, comm: [u8; 16]) -> Self {
+        Self { pid, _pad: 0, comm }
+    }
+}
+
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for PacketMetadata {}
 
@@ -107,3 +122,6 @@ unsafe impl aya::Pod for PacketMetadataV6 {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for BlocklistIpv6Key {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PidComm {}
