@@ -8,6 +8,7 @@ use common::FlowRow;
 use log::{debug, warn};
 
 static WARNED_SS_FAIL: AtomicBool = AtomicBool::new(false);
+static WARNED_SS_NETNS: AtomicBool = AtomicBool::new(false);
 
 /// one parsed row from `ss -tu -n -H [-p]`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,14 +132,35 @@ fn flow_matches_ss(row: &FlowRow, ss: &SsRow) -> bool {
     a == x && b == y || a == y && b == x
 }
 
-fn run_ss() -> Option<Vec<SsRow>> {
-    let try_with_p = match Command::new("ss").args(["-tu", "-n", "-H", "-p"]).output() {
-        Ok(o) => o,
-        Err(e) => {
-            if !WARNED_SS_FAIL.swap(true, Ordering::SeqCst) {
-                warn!("could not run ss (is iproute2 installed?): {e}");
+fn ss_command(netns: Option<&str>) -> Command {
+    match netns {
+        None => Command::new("ss"),
+        Some(ns) => {
+            let mut c = Command::new("ip");
+            c.args(["netns", "exec", ns, "ss"]);
+            c
+        }
+    }
+}
+
+/// Run `ss -tu -n -H [-p]` in the current or given network namespace (`ip netns exec …`).
+fn run_ss_once(netns: Option<&str>) -> Option<Vec<SsRow>> {
+    let label = netns.unwrap_or("host");
+    let try_with_p = {
+        let mut c = ss_command(netns);
+        c.args(["-tu", "-n", "-H", "-p"]);
+        match c.output() {
+            Ok(o) => o,
+            Err(e) => {
+                if netns.is_some() {
+                    if !WARNED_SS_NETNS.swap(true, Ordering::SeqCst) {
+                        warn!("ss in netns {label}: spawn failed ({e}); check `ip netns` and privileges");
+                    }
+                } else if !WARNED_SS_FAIL.swap(true, Ordering::SeqCst) {
+                    warn!("could not run ss (is iproute2 installed?): {e}");
+                }
+                return None;
             }
-            return None;
         }
     };
     let (stdout, use_fallback) = if try_with_p.status.success() {
@@ -146,19 +168,32 @@ fn run_ss() -> Option<Vec<SsRow>> {
     } else {
         let stderr = String::from_utf8_lossy(&try_with_p.stderr);
         if stderr.contains("Operation not permitted") || stderr.contains("permission denied") {
-            debug!("ss -p not permitted; retrying without -p");
+            debug!("ss -p not permitted in {label}; retrying without -p");
         }
-        let no_p = match Command::new("ss").args(["-tu", "-n", "-H"]).output() {
+        let mut c = ss_command(netns);
+        c.args(["-tu", "-n", "-H"]);
+        let no_p = match c.output() {
             Ok(o) => o,
             Err(e) => {
-                if !WARNED_SS_FAIL.swap(true, Ordering::SeqCst) {
+                if netns.is_some() {
+                    if !WARNED_SS_NETNS.swap(true, Ordering::SeqCst) {
+                        warn!("ss (no -p) in netns {label}: spawn failed ({e})");
+                    }
+                } else if !WARNED_SS_FAIL.swap(true, Ordering::SeqCst) {
                     warn!("ss (no -p) spawn failed: {e}");
                 }
                 return None;
             }
         };
         if !no_p.status.success() {
-            if !WARNED_SS_FAIL.swap(true, Ordering::SeqCst) {
+            if netns.is_some() {
+                if !WARNED_SS_NETNS.swap(true, Ordering::SeqCst) {
+                    warn!(
+                        "ss in netns {label} failed: {}",
+                        String::from_utf8_lossy(&no_p.stderr).trim()
+                    );
+                }
+            } else if !WARNED_SS_FAIL.swap(true, Ordering::SeqCst) {
                 warn!(
                     "ss failed (stderr): {}",
                     String::from_utf8_lossy(&no_p.stderr).trim()
@@ -169,7 +204,7 @@ fn run_ss() -> Option<Vec<SsRow>> {
         (no_p.stdout, true)
     };
 
-    if use_fallback && !WARNED_SS_FAIL.swap(true, Ordering::SeqCst) {
+    if use_fallback && netns.is_none() && !WARNED_SS_FAIL.swap(true, Ordering::SeqCst) {
         debug!("using ss without -p (no PIDs)");
     }
 
@@ -183,11 +218,25 @@ fn run_ss() -> Option<Vec<SsRow>> {
     Some(rows)
 }
 
-/// fold ss rows into flows: only fill `local_pid` where it was missing and `-p` gave a pid
-pub fn enrich_flows_from_ss(flows_rx: &mut [FlowRow], flows_tx: &mut [FlowRow]) {
-    let Some(ss_rows) = run_ss() else {
+/// fold ss rows into flows: only fill `local_pid` where it was missing and `-p` gave a pid.
+/// Merges host `ss` with optional `ip netns exec <extra_netns> ss` so workloads in another netns match.
+pub fn enrich_flows_from_ss(
+    flows_rx: &mut [FlowRow],
+    flows_tx: &mut [FlowRow],
+    extra_netns: Option<&str>,
+) {
+    let mut ss_rows: Vec<SsRow> = Vec::new();
+    if let Some(rows) = run_ss_once(None) {
+        ss_rows.extend(rows);
+    }
+    if let Some(ns) = extra_netns.filter(|s| !s.is_empty()) {
+        if let Some(rows) = run_ss_once(Some(ns)) {
+            ss_rows.extend(rows);
+        }
+    }
+    if ss_rows.is_empty() {
         return;
-    };
+    }
 
     for row in flows_rx.iter_mut().chain(flows_tx.iter_mut()) {
         if row.local_pid.is_some() {

@@ -587,8 +587,13 @@ async fn main() -> anyhow::Result<()> {
     );
     if eff.proc_pid_correlation {
         println!(
-            "PID: /proc/net/tcp+udp inode + /proc/*/fd scan each tick; use --ss-enrich for ss(8) cross-check"
+            "PID: /proc/net/tcp+udp inode + /proc/*/fd scan each tick; ss(8) cross-check when any flow lacks pid"
         );
+        if let Some(ns) = eff.ss_netns.as_ref() {
+            println!(
+                "     also merge `ip netns exec {ns} ss -tu -n -H -p` (workloads in that Linux network namespace)"
+            );
+        }
     } else {
         println!("PID: disabled (--proc-pid-correlation=false)");
     }
@@ -674,7 +679,7 @@ async fn main() -> anyhow::Result<()> {
             .chain(flows_tx.iter())
             .any(|row| row.local_pid.is_none());
         if eff.ss_enrich || have_any_missing_pid {
-            ss_enrich::enrich_flows_from_ss(&mut flows_rx, &mut flows_tx);
+            ss_enrich::enrich_flows_from_ss(&mut flows_rx, &mut flows_tx, eff.ss_netns.as_deref());
             attr::enrich_flow_rows(&mut flows_rx);
             attr::enrich_flow_rows(&mut flows_tx);
         }

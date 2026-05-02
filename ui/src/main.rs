@@ -72,6 +72,41 @@ fn fmt_pid_user(pid: Option<u32>, uid: Option<u32>, username: Option<&str>) -> S
     }
 }
 
+fn flow_attribution_rich_text(row: &FlowRow) -> RichText {
+    if row.local_pid.is_some() || row.local_uid.is_some() || row.local_username.is_some() {
+        return RichText::new(fmt_pid_user(
+            row.local_pid,
+            row.local_uid,
+            row.local_username.as_deref(),
+        ))
+        .small()
+        .color(CLR_MUTED);
+    }
+    match row.protocol.as_str() {
+        "ICMP" | "ICMPv6" | "IGMP" => RichText::new("L3 · no socket")
+            .small()
+            .italics()
+            .color(CLR_YELLOW),
+        "TCP" | "UDP" => RichText::new("—").small().color(CLR_MUTED),
+        _ => RichText::new("—").small().color(CLR_MUTED),
+    }
+}
+
+fn flow_attribution_hover(row: &FlowRow) -> Option<&'static str> {
+    if row.local_pid.is_some() {
+        return None;
+    }
+    Some(match row.protocol.as_str() {
+        "ICMP" | "ICMPv6" | "IGMP" => {
+            "ICMP/IGMP are not in /proc/net/tcp or UDP. There is no per-flow PID in the standard Linux APIs for these protocols."
+        }
+        "TCP" | "UDP" => {
+            "No match in /proc inode scan, eBPF sport map, or merged ss(8) output. If traffic belongs to another network namespace (Docker, rootless, VM bridge), restart kernel-spy with --ss-netns <linux-netns-name> so ss is run inside that namespace as well. Run kernel-spy with privileges if ss -p is denied."
+        }
+        _ => "No standard socket-based attribution for this protocol.",
+    })
+}
+
 fn alert_color(severity: &str) -> Color32 {
     match severity {
         "critical" => CLR_RED,
@@ -857,6 +892,18 @@ impl App {
                     }
                 }
             });
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new(
+                RichText::new("Process column: “—” vs “L3 · no socket”").strong().size(12.0),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(RichText::new(
+                    "• TCP/UDP: needs a match in /proc, the eBPF sport map, or ss (host + optional --ss-netns).\n\
+                     • ICMP / similar: not in /proc sockets — label shows L3 · no socket.\n\
+                     • Settings tab has copy-paste hints for iface and netns.",
+                ).size(11.0).color(CLR_MUTED));
+            });
             ui.add_space(10.0);
 
             let filter_lc = self.flow_filter.trim().to_lowercase();
@@ -1129,13 +1176,25 @@ impl App {
             if let Some(s) = snap {
                 kv_pair(ui, "Active iface", &s.iface);
                 ui.add_space(10.0);
+                section_header(ui, "Process attribution (TCP/UDP)");
+                ui.add_space(4.0);
+                ui.label(RichText::new(
+                    "If the Flows tab shows “—” for TCP/UDP while traffic is from a container or netns, run kernel-spy with \
+                     --ss-netns <name> so ss merges sockets from `ip netns exec <name> ss …` with the host ss output. \
+                     Example netns names: check `ip netns list` or your container runtime docs.",
+                ).size(11.0).color(CLR_MUTED));
+                ui.add_space(10.0);
                 let suggested = format!(
                     "kernel-spy -i {} --export-socket /tmp/ipc-netmon.sock --control-socket /tmp/ipc-netmon-ctl.sock",
                     s.iface
                 );
+                let suggested_netns = format!("{suggested} --ss-netns <your-netns>");
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new("Copy suggested command").color(CLR_ACCENT)).clicked() {
+                    if ui.button(RichText::new("Copy start command").color(CLR_ACCENT)).clicked() {
                         ui.output_mut(|o| o.copied_text = suggested.clone());
+                    }
+                    if ui.button(RichText::new("Copy + --ss-netns template").color(CLR_ACCENT)).clicked() {
+                        ui.output_mut(|o| o.copied_text = suggested_netns.clone());
                     }
                 });
                 ui.add_space(6.0);
@@ -1146,6 +1205,8 @@ impl App {
                     .inner_margin(Margin::same(10.0))
                     .show(ui, |ui| {
                         ui.label(RichText::new(&suggested).monospace().small().color(CLR_TEXT));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&suggested_netns).monospace().small().color(CLR_MUTED));
                     });
             } else {
                 ui.colored_label(CLR_MUTED, "No snapshot yet — start kernel-spy to see iface.");
@@ -1587,9 +1648,13 @@ fn flow_table_filtered(ui: &mut Ui, rows: &[&FlowRow], id: &str) {
                 .striped(true)
                 .spacing([10.0, 3.0])
                 .show(ui, |ui| {
-                    for hdr in ["Protocol", "Src IP:Port", "Dst IP:Port", "Bytes", "Process / User"] {
+                    for hdr in ["Protocol", "Src IP:Port", "Dst IP:Port", "Bytes"] {
                         ui.label(RichText::new(hdr).small().strong().color(CLR_MUTED));
                     }
+                    let pr = ui.label(RichText::new("Process / User").small().strong().color(CLR_MUTED));
+                    pr.on_hover_text(
+                        "Hover unattributed cells for hints. ICMP uses L3 · no socket. TCP/UDP “—” may need --ss-netns.",
+                    );
                     ui.end_row();
                     for row in rows.iter().take(FLOW_TABLE_MAX_ROWS) {
                         // protocol badge
@@ -1608,9 +1673,11 @@ fn flow_table_filtered(ui: &mut Ui, rows: &[&FlowRow], id: &str) {
                             format!("{}:{}", row.dst_ip, row.dst_port)
                         ).monospace().small().color(CLR_TEXT));
                         ui.label(RichText::new(fmt_bytes(row.bytes)).small().color(CLR_GREEN));
-                        ui.label(RichText::new(
-                            fmt_pid_user(row.local_pid, row.local_uid, row.local_username.as_deref())
-                        ).small().color(CLR_MUTED));
+                        let ar = flow_attribution_rich_text(row);
+                        let resp = ui.add(egui::Label::new(ar));
+                        if let Some(tip) = flow_attribution_hover(row) {
+                            resp.on_hover_text(tip);
+                        }
                         ui.end_row();
                     }
                 });

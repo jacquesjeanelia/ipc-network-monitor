@@ -87,8 +87,13 @@ See [docs/CAPABILITY_REQUIREMENTS.md](../docs/CAPABILITY_REQUIREMENTS.md) for de
     Disable for low-CPU mode (flow PIDs will be 'unknown').
 
 --ss-enrich [true|false]
-    Enable ss(8) command enrichment for socket state. Default: false.
-    Adds validation to inode correlation; increases CPU.
+    When true, always run an extra ss(8) pass each tick. By default, ss is still run whenever
+    any flow row lacks a PID (merging host `ss` with optional netns output). Default: false.
+
+--ss-netns <NAME>
+    Also run `ip netns exec <NAME> ss -tu -n -H -p` and merge with host `ss` for PID matching.
+    Use when workloads live in another Linux network namespace (Docker/LXC/rootless). Requires
+    `ip netns` privileges.
 ```
 
 ### Alerting
@@ -164,6 +169,7 @@ skip_tcp_retransmit_trace = false
 [monitoring]
 proc_pid_correlation = true
 ss_enrich = false
+# ss_netns = "mynetns"   # optional: merge ss from this network namespace
 max_flow_rows = 500
 
 [alerting]

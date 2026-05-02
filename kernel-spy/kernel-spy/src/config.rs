@@ -97,6 +97,10 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub ss_enrich: bool,
 
+    /// also merge `ip netns exec <NAME> ss …` with host `ss` (Docker/LXC/rootless netns); needs privileges
+    #[arg(long, value_name = "NAME")]
+    pub ss_netns: Option<String>,
+
     /// if set, large netem delays need `--netem-confirm`; otherwise we only log a warning
     #[arg(long, default_value_t = false)]
     pub netem_confirm: bool,
@@ -129,6 +133,7 @@ pub struct ConfigFile {
     pub seed_demo_blocklist: Option<bool>,
     pub proc_pid_correlation: Option<bool>,
     pub ss_enrich: Option<bool>,
+    pub ss_netns: Option<String>,
     pub netem_confirm: Option<bool>,
     pub audit_log: Option<PathBuf>,
     /// optional `tc netem` delay (ms) on root qdisc; privileged — see `tc_control`
@@ -157,6 +162,7 @@ pub struct EffectiveConfig {
     pub alert_rx_ema_alpha: f64,
     pub alert_top_pid_bytes: u64,
     pub ss_enrich: bool,
+    pub ss_netns: Option<String>,
     pub netem_confirm: bool,
     pub max_flow_rows: usize,
     pub proc_pid_correlation: bool,
@@ -197,6 +203,10 @@ pub fn effective(cli: &Cli, file: &Option<ConfigFile>) -> EffectiveConfig {
             .and_then(|x| x.alert_top_pid_bytes)
             .unwrap_or(cli.alert_top_pid_bytes),
         ss_enrich: f.and_then(|x| x.ss_enrich).unwrap_or(cli.ss_enrich),
+        ss_netns: f
+            .and_then(|x| x.ss_netns.clone())
+            .or_else(|| cli.ss_netns.clone())
+            .filter(|s| !s.is_empty()),
         netem_confirm: f.and_then(|x| x.netem_confirm).unwrap_or(cli.netem_confirm),
         max_flow_rows: f.and_then(|x| x.max_flow_rows).unwrap_or(cli.max_flow_rows),
         proc_pid_correlation: f
