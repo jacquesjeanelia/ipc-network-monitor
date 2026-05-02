@@ -643,15 +643,27 @@ async fn main() -> anyhow::Result<()> {
         attr::enrich_flow_rows(&mut flows_rx);
         attr::enrich_flow_rows(&mut flows_tx);
 
-        // Enrich flows missing pid attribution from the eBPF sport→pid map (catches short-lived processes)
+        // Enrich flows missing pid attribution from the eBPF sport→pid map (catches short-lived processes).
+        // Map keys are the local TCP sport at ESTABLISHED; RX packets often have the local ephemeral in
+        // `dst_port` (remote:443 → local:ephemeral), so try both ports for TCP/UDP.
         if let Some(ref smap) = sock_sport_pid {
             for row in flows_rx.iter_mut().chain(flows_tx.iter_mut()) {
-                if row.local_pid.is_none() {
-                    if let Some((pid, comm)) = proc_corr::pid_comm_from_ebpf_map(row.src_port, smap) {
+                if row.local_pid.is_some() {
+                    continue;
+                }
+                if !matches!(row.protocol.as_str(), "TCP" | "UDP") {
+                    continue;
+                }
+                for p in [row.src_port, row.dst_port] {
+                    if p == 0 {
+                        continue;
+                    }
+                    if let Some((pid, comm)) = proc_corr::pid_comm_from_ebpf_map(p, smap) {
                         row.local_pid = Some(pid);
                         if row.local_username.is_none() {
                             row.local_username = Some(comm);
                         }
+                        break;
                     }
                 }
             }

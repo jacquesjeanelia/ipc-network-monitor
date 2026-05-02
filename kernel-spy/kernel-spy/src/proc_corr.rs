@@ -299,7 +299,7 @@ pub fn pid_via_proc_socket(meta: &PacketMetadata, cache: &InodePidCache) -> Opti
     cache.pid_for_inode(inode)
 }
 
-/// Look up pid+comm from the eBPF SOCK_SPORT_PID map by src_port.
+/// Look up pid+comm from the eBPF SOCK_SPORT_PID map by a candidate local port (try src_port and dst_port).
 /// Falls back gracefully if the entry is absent.
 pub fn pid_comm_from_ebpf_map<T: std::borrow::Borrow<aya::maps::MapData>>(
     sport: u16,

@@ -99,7 +99,7 @@ impl HealthCounterIndex {
     }
 }
 
-/// pid + process name, stored in SOCK_SPORT_PID keyed by src port
+/// pid + process name in SOCK_SPORT_PID, keyed by local TCP sport at ESTABLISHED (host byte order)
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct PidComm {
