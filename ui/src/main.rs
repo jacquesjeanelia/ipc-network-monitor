@@ -1,6 +1,6 @@
 //! IPC Network Monitor — Professional egui UI (v2)
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,8 @@ const RECENT_SIGHTINGS_CAP: usize = 64;
 const EXPORT_SOCK: &str = "/tmp/ipc-netmon.sock";
 const CONTROL_SOCK: &str = "/tmp/ipc-netmon-ctl.sock";
 const MAX_ALERT_LOG: usize = 500;
+/// Show all flows present in the snapshot (server caps with `--max-flow-rows`).
+const FLOW_TABLE_MAX_ROWS: usize = 512;
 
 // ── palette ─────────────────────────────────────────────────────────────────
 
@@ -80,10 +82,11 @@ fn alert_color(severity: &str) -> Color32 {
 
 fn proto_color(proto: &str) -> Color32 {
     match proto {
-        "TCP"  => CLR_BLUE_LIGHT,
-        "UDP"  => CLR_YELLOW,
-        "ICMP" => CLR_PURPLE,
-        _      => CLR_MUTED,
+        "TCP" => CLR_BLUE_LIGHT,
+        "UDP" => CLR_YELLOW,
+        "ICMP" | "ICMPv6" => CLR_PURPLE,
+        "IGMP" | "GRE" | "SCTP" | "ESP" | "AH" => CLR_ORANGE,
+        _ => CLR_MUTED,
     }
 }
 
@@ -91,24 +94,41 @@ fn proto_color(proto: &str) -> Color32 {
 
 #[derive(Clone, Default)]
 struct ProtoSnapshot {
-    elapsed:     f64,
-    tcp_bytes:   u64,
-    udp_bytes:   u64,
-    icmp_bytes:  u64,
-    other_bytes: u64,
+    elapsed:       f64,
+    tcp_bytes:     u64,
+    udp_bytes:     u64,
+    icmp_bytes:    u64,
+    icmpv6_bytes:  u64,
+    igmp_bytes:    u64,
+    gre_bytes:     u64,
+    sctp_bytes:    u64,
+    esp_bytes:     u64,
+    ah_bytes:      u64,
+    other_bytes:   u64,
 }
 
-fn classify_flow_bytes(flows: &[FlowRow]) -> (u64, u64, u64, u64) {
-    let (mut tcp, mut udp, mut icmp, mut other) = (0u64, 0u64, 0u64, 0u64);
+fn classify_flow_bytes(flows: &[FlowRow]) -> ProtoSnapshot {
+    let mut s = ProtoSnapshot::default();
     for f in flows {
         match f.protocol.as_str() {
-            "TCP"  => tcp   += f.bytes,
-            "UDP"  => udp   += f.bytes,
-            "ICMP" => icmp  += f.bytes,
-            _      => other += f.bytes,
+            "TCP"     => s.tcp_bytes    += f.bytes,
+            "UDP"     => s.udp_bytes    += f.bytes,
+            "ICMP"    => s.icmp_bytes   += f.bytes,
+            "ICMPv6"  => s.icmpv6_bytes += f.bytes,
+            "IGMP"    => s.igmp_bytes   += f.bytes,
+            "GRE"     => s.gre_bytes    += f.bytes,
+            "SCTP"    => s.sctp_bytes   += f.bytes,
+            "ESP"     => s.esp_bytes    += f.bytes,
+            "AH"      => s.ah_bytes     += f.bytes,
+            _         => s.other_bytes  += f.bytes,
         }
     }
-    (tcp, udp, icmp, other)
+    s
+}
+
+fn proto_snapshot_elapsed(mut s: ProtoSnapshot, elapsed: f64) -> ProtoSnapshot {
+    s.elapsed = elapsed;
+    s
 }
 
 // ── shared state ─────────────────────────────────────────────────────────────
@@ -119,10 +139,14 @@ struct SharedState {
     recent_user_sightings: VecDeque<UserTrafficRow>,
     rx_rate_history: VecDeque<[f64; 2]>,
     tx_rate_history: VecDeque<[f64; 2]>,
+    port_rate_history: VecDeque<[f64; 2]>,
     proto_history: VecDeque<ProtoSnapshot>,
     prev_rx_bytes: Option<u64>,
     prev_tx_bytes: Option<u64>,
     prev_ts_ms: Option<u64>,
+    prev_port_matched_bytes: Option<u64>,
+    /// Sum of flow bytes (RX+TX) where `src_port` or `dst_port` matches; drives port rate chart.
+    selected_port: Option<u16>,
     start: Instant,
     connected: bool,
     alert_log: Vec<AlertEvent>,
@@ -137,10 +161,13 @@ impl SharedState {
             recent_user_sightings: VecDeque::new(),
             rx_rate_history: VecDeque::new(),
             tx_rate_history: VecDeque::new(),
+            port_rate_history: VecDeque::new(),
             proto_history: VecDeque::new(),
             prev_rx_bytes: None,
             prev_tx_bytes: None,
             prev_ts_ms: None,
+            prev_port_matched_bytes: None,
+            selected_port: None,
             start: Instant::now(),
             connected: false,
             alert_log: Vec::new(),
@@ -171,6 +198,17 @@ impl SharedState {
     fn ingest(&mut self, snap: MonitorSnapshotV1) {
         let elapsed = self.start.elapsed().as_secs_f64();
 
+        let mut port_bytes_cur: Option<u64> = None;
+        if let Some(port) = self.selected_port {
+            let mut b = 0u64;
+            for f in snap.flows_rx.iter().chain(snap.flows_tx.iter()) {
+                if f.src_port == port || f.dst_port == port {
+                    b = b.saturating_add(f.bytes);
+                }
+            }
+            port_bytes_cur = Some(b);
+        }
+
         if let (Some(prx), Some(ptx), Some(pts)) =
             (self.prev_rx_bytes, self.prev_tx_bytes, self.prev_ts_ms)
         {
@@ -182,18 +220,33 @@ impl SharedState {
                 self.rx_rate_history.push_back([elapsed, rx_rate]);
                 if self.tx_rate_history.len() >= HISTORY_CAP { self.tx_rate_history.pop_front(); }
                 self.tx_rate_history.push_back([elapsed, tx_rate]);
+
+                if let (Some(pb), Some(ppb)) = (port_bytes_cur, self.prev_port_matched_bytes) {
+                    let prate = pb.saturating_sub(ppb) as f64 / dt;
+                    if self.port_rate_history.len() >= HISTORY_CAP {
+                        self.port_rate_history.pop_front();
+                    }
+                    self.port_rate_history.push_back([elapsed, prate]);
+                }
             }
         }
         self.prev_rx_bytes = Some(snap.rx.bytes);
         self.prev_tx_bytes = Some(snap.tx.bytes);
         self.prev_ts_ms    = Some(snap.ts_unix_ms);
 
+        if let Some(pb) = port_bytes_cur {
+            self.prev_port_matched_bytes = Some(pb);
+        } else {
+            self.prev_port_matched_bytes = None;
+            self.port_rate_history.clear();
+        }
+
         // Protocol breakdown snapshot
         let mut all_flows: Vec<FlowRow> = snap.flows_rx.clone();
         all_flows.extend_from_slice(&snap.flows_tx);
-        let (tcp, udp, icmp, other) = classify_flow_bytes(&all_flows);
+        let proto = classify_flow_bytes(&all_flows);
         if self.proto_history.len() >= PROTO_HISTORY_CAP { self.proto_history.pop_front(); }
-        self.proto_history.push_back(ProtoSnapshot { elapsed, tcp_bytes: tcp, udp_bytes: udp, icmp_bytes: icmp, other_bytes: other });
+        self.proto_history.push_back(proto_snapshot_elapsed(proto, elapsed));
 
         for row in &snap.aggregates_by_pid  { self.remember_process_sighting(row); }
         for row in &snap.aggregates_by_user { self.remember_user_sighting(row); }
@@ -208,7 +261,14 @@ impl SharedState {
 // ── app ──────────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { Dashboard, Flows, Processes, Audit, Control }
+enum Tab {
+    Dashboard,
+    Flows,
+    Processes,
+    Audit,
+    Control,
+    Settings,
+}
 
 struct App {
     state: Arc<Mutex<SharedState>>,
@@ -290,13 +350,14 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(500));
 
-        let (connected, snap, rx_hist, tx_hist, proto_hist, alert_log, rpc_result, recent_procs, recent_users) = {
+        let (connected, snap, rx_hist, tx_hist, port_hist, proto_hist, alert_log, rpc_result, recent_procs, recent_users) = {
             let s = self.state.lock().unwrap();
             (
                 s.connected,
                 s.snapshot.clone(),
                 s.rx_rate_history.iter().cloned().collect::<Vec<_>>(),
                 s.tx_rate_history.iter().cloned().collect::<Vec<_>>(),
+                s.port_rate_history.iter().cloned().collect::<Vec<_>>(),
                 s.proto_history.iter().cloned().collect::<Vec<_>>(),
                 s.alert_log.clone(),
                 s.rpc_result.clone(),
@@ -340,6 +401,7 @@ impl eframe::App for App {
                     (Tab::Processes,  "◈", "Processes"),
                     (Tab::Audit,      "◎", "Audit"),
                     (Tab::Control,    "⚙", "Control"),
+                    (Tab::Settings,   "◇", "Settings"),
                 ];
 
                 for &(tab, icon, label) in entries {
@@ -420,6 +482,7 @@ impl eframe::App for App {
                         Tab::Processes  => "Process & User Correlation",
                         Tab::Audit      => "Audit & Alerts",
                         Tab::Control    => "Policy Control",
+                        Tab::Settings   => "Settings",
                     };
                     ui.label(RichText::new(tab_name).size(15.0).strong().color(CLR_TEXT));
 
@@ -447,11 +510,12 @@ impl eframe::App for App {
                 .inner_margin(Margin::same(16.0)))
             .show(ctx, |ui| {
                 match self.active_tab {
-                    Tab::Dashboard  => show_dashboard(ui, snap.as_ref(), &rx_hist, &tx_hist, &proto_hist),
+                    Tab::Dashboard  => self.show_dashboard(ui, snap.as_ref(), &rx_hist, &tx_hist, &port_hist, &proto_hist),
                     Tab::Flows      => self.show_flows(ui, snap.as_ref()),
-                    Tab::Processes  => show_processes(ui, snap.as_ref(), &recent_procs, &recent_users),
+                    Tab::Processes  => self.show_processes(ui, snap.as_ref(), &recent_procs, &recent_users),
                     Tab::Audit      => self.show_audit(ui, snap.as_ref(), &alert_log),
                     Tab::Control    => self.show_control(ui, &rpc_result),
+                    Tab::Settings   => self.show_settings(ui, snap.as_ref()),
                 }
             });
     }
@@ -459,29 +523,54 @@ impl eframe::App for App {
 
 // ── Dashboard ────────────────────────────────────────────────────────────────
 
-fn show_dashboard(
-    ui: &mut Ui,
-    snap: Option<&MonitorSnapshotV1>,
-    rx_hist: &[[f64; 2]],
-    tx_hist: &[[f64; 2]],
-    proto_hist: &[ProtoSnapshot],
-) {
-    let Some(snap) = snap else {
-        ui.centered_and_justified(|ui| {
-            ui.label(
-                RichText::new("No data — is kernel-spy running without --no-export-socket?")
-                    .size(16.0).color(CLR_MUTED),
-            );
-        });
-        return;
-    };
+impl App {
+    fn show_dashboard(
+        &mut self,
+        ui: &mut Ui,
+        snap: Option<&MonitorSnapshotV1>,
+        rx_hist: &[[f64; 2]],
+        tx_hist: &[[f64; 2]],
+        port_hist: &[[f64; 2]],
+        proto_hist: &[ProtoSnapshot],
+    ) {
+        let Some(snap) = snap else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("No data — is kernel-spy running without --no-export-socket?")
+                        .size(16.0).color(CLR_MUTED),
+                );
+            });
+            return;
+        };
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
+        let mut sel_port = self.state.lock().unwrap().selected_port;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
         // compute protocol totals for current tick
         let mut all_flows: Vec<FlowRow> = snap.flows_rx.clone();
         all_flows.extend_from_slice(&snap.flows_tx);
-        let (tcp_b, udp_b, icmp_b, other_b) = classify_flow_bytes(&all_flows);
-        let proto_total = tcp_b + udp_b + icmp_b + other_b;
+        let cl = classify_flow_bytes(&all_flows);
+        let proto_total = cl.tcp_bytes
+            .saturating_add(cl.udp_bytes)
+            .saturating_add(cl.icmp_bytes)
+            .saturating_add(cl.icmpv6_bytes)
+            .saturating_add(cl.igmp_bytes)
+            .saturating_add(cl.gre_bytes)
+            .saturating_add(cl.sctp_bytes)
+            .saturating_add(cl.esp_bytes)
+            .saturating_add(cl.ah_bytes)
+            .saturating_add(cl.other_bytes);
+
+        let mut ports_seen: BTreeSet<u16> = BTreeSet::new();
+        for f in all_flows.iter() {
+            if f.src_port != 0 {
+                ports_seen.insert(f.src_port);
+            }
+            if f.dst_port != 0 {
+                ports_seen.insert(f.dst_port);
+            }
+        }
+        let port_list: Vec<u16> = ports_seen.into_iter().take(48).collect();
 
         // ── two-column layout ─────────────────────────────────────────
         let avail = ui.available_width();
@@ -541,13 +630,25 @@ fn show_dashboard(
                         .rounding(Rounding::same(8.0))
                         .inner_margin(Margin::same(10.0))
                         .show(ui, |ui| {
-                            proto_bar(ui, "TCP",   tcp_b,   proto_total, CLR_BLUE_LIGHT);
+                            proto_bar(ui, "TCP",     cl.tcp_bytes,    proto_total, CLR_BLUE_LIGHT);
                             ui.add_space(4.0);
-                            proto_bar(ui, "UDP",   udp_b,   proto_total, CLR_YELLOW);
+                            proto_bar(ui, "UDP",     cl.udp_bytes,    proto_total, CLR_YELLOW);
                             ui.add_space(4.0);
-                            proto_bar(ui, "ICMP",  icmp_b,  proto_total, CLR_PURPLE);
+                            proto_bar(ui, "ICMP",    cl.icmp_bytes,   proto_total, CLR_PURPLE);
                             ui.add_space(4.0);
-                            proto_bar(ui, "Other", other_b, proto_total, CLR_MUTED);
+                            proto_bar(ui, "ICMPv6",  cl.icmpv6_bytes, proto_total, CLR_PURPLE);
+                            ui.add_space(4.0);
+                            proto_bar(ui, "IGMP",    cl.igmp_bytes,   proto_total, CLR_ORANGE);
+                            ui.add_space(4.0);
+                            proto_bar(ui, "GRE",     cl.gre_bytes,    proto_total, CLR_ORANGE);
+                            ui.add_space(4.0);
+                            proto_bar(ui, "SCTP",    cl.sctp_bytes,   proto_total, CLR_ORANGE);
+                            ui.add_space(4.0);
+                            proto_bar(ui, "ESP",     cl.esp_bytes,    proto_total, CLR_MUTED);
+                            ui.add_space(4.0);
+                            proto_bar(ui, "AH",      cl.ah_bytes,     proto_total, CLR_MUTED);
+                            ui.add_space(4.0);
+                            proto_bar(ui, "Other",   cl.other_bytes,  proto_total, CLR_MUTED);
                         });
 
                     // ── current-tick alerts ───────────────────────────
@@ -572,10 +673,36 @@ fn show_dashboard(
                     ui.add_space(4.0);
                     let rx_rate = rx_hist.last().map(|p| p[1]).unwrap_or(0.0);
                     let tx_rate = tx_hist.last().map(|p| p[1]).unwrap_or(0.0);
+                    let port_rate = port_hist.last().map(|p| p[1]).unwrap_or(0.0);
                     ui.horizontal(|ui| {
                         rate_badge(ui, "↓ RX", rx_rate, CLR_GREEN);
                         ui.add_space(8.0);
                         rate_badge(ui, "↑ TX", tx_rate, CLR_ORANGE);
+                        if sel_port.is_some() {
+                            ui.add_space(8.0);
+                            rate_badge(ui, "Port Σ", port_rate, CLR_BLUE_LIGHT);
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Chart port (src or dst match)").size(11.0).color(CLR_MUTED));
+                        egui::ComboBox::from_id_salt("dash_mon_port")
+                            .width(100.0)
+                            .selected_text(match sel_port {
+                                None => "None".to_string(),
+                                Some(p) => p.to_string(),
+                            })
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(sel_port.is_none(), "None").clicked() {
+                                    sel_port = None;
+                                }
+                                for &p in &port_list {
+                                    let lab = p.to_string();
+                                    if ui.selectable_label(sel_port == Some(p), &lab).clicked() {
+                                        sel_port = Some(p);
+                                    }
+                                }
+                            });
                     });
                     ui.add_space(6.0);
                     egui::Frame::none()
@@ -598,6 +725,14 @@ fn show_dashboard(
                                     if !tx_hist.is_empty() {
                                         pui.line(Line::new(PlotPoints::new(tx_hist.to_vec()))
                                             .color(CLR_ORANGE).name("TX (B/s)").width(2.0));
+                                    }
+                                    if sel_port.is_some() && !port_hist.is_empty() {
+                                        let name = format!(
+                                            "Flows port {} (B/s)",
+                                            sel_port.unwrap()
+                                        );
+                                        pui.line(Line::new(PlotPoints::new(port_hist.to_vec()))
+                                            .color(CLR_BLUE_LIGHT).name(name).width(1.8));
                                     }
                                 });
                         });
@@ -627,12 +762,29 @@ fn show_dashboard(
                                             .map(|p| [p.elapsed, p.udp_bytes as f64]).collect();
                                         let icmp_pts: Vec<[f64; 2]> = proto_hist.iter()
                                             .map(|p| [p.elapsed, p.icmp_bytes as f64]).collect();
+                                        let icmpv6_pts: Vec<[f64; 2]> = proto_hist.iter()
+                                            .map(|p| [p.elapsed, p.icmpv6_bytes as f64]).collect();
+                                        let rest_pts: Vec<[f64; 2]> = proto_hist.iter()
+                                            .map(|p| {
+                                                let r = p.igmp_bytes
+                                                    .saturating_add(p.gre_bytes)
+                                                    .saturating_add(p.sctp_bytes)
+                                                    .saturating_add(p.esp_bytes)
+                                                    .saturating_add(p.ah_bytes)
+                                                    .saturating_add(p.other_bytes);
+                                                [p.elapsed, r as f64]
+                                            })
+                                            .collect();
                                         pui.line(Line::new(PlotPoints::new(tcp_pts))
                                             .color(CLR_BLUE_LIGHT).name("TCP").width(1.5));
                                         pui.line(Line::new(PlotPoints::new(udp_pts))
                                             .color(CLR_YELLOW).name("UDP").width(1.5));
                                         pui.line(Line::new(PlotPoints::new(icmp_pts))
                                             .color(CLR_PURPLE).name("ICMP").width(1.5));
+                                        pui.line(Line::new(PlotPoints::new(icmpv6_pts))
+                                            .color(Color32::from_rgb(0xd4, 0x8a, 0xff)).name("ICMPv6").width(1.5));
+                                        pui.line(Line::new(PlotPoints::new(rest_pts))
+                                            .color(CLR_MUTED).name("Other L4+").width(1.2));
                                     }
                                 });
                         });
@@ -679,11 +831,11 @@ fn show_dashboard(
             });
         });
     });
-}
+        if let Ok(mut s) = self.state.lock() {
+            s.selected_port = sel_port;
+        }
+    }
 
-// ── Flows tab ────────────────────────────────────────────────────────────────
-
-impl App {
     fn show_flows(&mut self, ui: &mut Ui, snap: Option<&MonitorSnapshotV1>) {
         let Some(snap) = snap else {
             ui.centered_and_justified(|ui| {
@@ -697,8 +849,8 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("🔍").size(14.0));
                 ui.add(egui::TextEdit::singleline(&mut self.flow_filter)
-                    .hint_text("Filter flows (IP, port, protocol)…")
-                    .desired_width(340.0));
+                    .hint_text("Filter: IP, port, protocol, user — or pid:1234 …")
+                    .desired_width(420.0));
                 if !self.flow_filter.is_empty() {
                     if styled_btn(ui, "✕ Clear").clicked() {
                         self.flow_filter.clear();
@@ -707,88 +859,122 @@ impl App {
             });
             ui.add_space(10.0);
 
-            let filter = self.flow_filter.to_lowercase();
+            let filter_lc = self.flow_filter.trim().to_lowercase();
 
-            fn filter_flows<'a>(rows: &'a [FlowRow], filter: &str) -> (Vec<&'a FlowRow>, usize) {
-                if filter.is_empty() {
+            fn filter_flows<'a>(rows: &'a [FlowRow], filter_lc: &str) -> (Vec<&'a FlowRow>, usize) {
+                if let Some(rest) = filter_lc.strip_prefix("pid:") {
+                    if let Ok(want) = rest.trim().parse::<u32>() {
+                        let filtered: Vec<&'a FlowRow> = rows
+                            .iter()
+                            .filter(|r| r.local_pid == Some(want))
+                            .collect();
+                        let hidden = rows.len().saturating_sub(filtered.len());
+                        return (filtered, hidden);
+                    }
+                }
+                if filter_lc.is_empty() {
                     return (rows.iter().collect(), 0);
                 }
-                let filtered: Vec<&'a FlowRow> = rows.iter().filter(|r| {
-                    r.src_ip.to_lowercase().contains(filter)
-                    || r.dst_ip.to_lowercase().contains(filter)
-                    || r.src_port.to_string().contains(filter)
-                    || r.dst_port.to_string().contains(filter)
-                    || r.protocol.to_lowercase().contains(filter)
-                    || r.local_username.as_deref().unwrap_or("").to_lowercase().contains(filter)
-                }).collect();
+                let filtered: Vec<&'a FlowRow> = rows
+                    .iter()
+                    .filter(|r| {
+                        r.src_ip.to_lowercase().contains(filter_lc)
+                            || r.dst_ip.to_lowercase().contains(filter_lc)
+                            || r.src_port.to_string().contains(filter_lc)
+                            || r.dst_port.to_string().contains(filter_lc)
+                            || r.protocol.to_lowercase().contains(filter_lc)
+                            || r.local_username.as_deref().unwrap_or("").to_lowercase().contains(filter_lc)
+                            || r.local_pid
+                                .map(|p| filter_lc.contains(&p.to_string()))
+                                .unwrap_or(false)
+                    })
+                    .collect();
                 let hidden = rows.len().saturating_sub(filtered.len());
                 (filtered, hidden)
             }
 
-            let (rx_filtered, rx_hidden) = filter_flows(&snap.flows_rx, &filter);
-            let (tx_filtered, tx_hidden) = filter_flows(&snap.flows_tx, &filter);
+            let (rx_filtered, rx_hidden) = filter_flows(&snap.flows_rx, &filter_lc);
+            let (tx_filtered, tx_hidden) = filter_flows(&snap.flows_tx, &filter_lc);
 
-            // RX section
-            ui.horizontal(|ui| {
-                section_header(ui, &format!("RX Flows"));
-                ui.add_space(6.0);
-                count_badge(ui, rx_filtered.len());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if export_btn(ui, "Export CSV →").clicked() {
-                        let r = self.rpc("export_flows_csv", serde_json::json!({
-                            "path": "/tmp/netmon-flows-export.csv"
-                        }));
-                        self.set_rpc_result(r);
+            ui.columns(2, |cols| {
+                cols[0].vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        section_header(ui, "RX Flows");
+                        ui.add_space(6.0);
+                        count_badge(ui, rx_filtered.len());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if export_btn(ui, "Export CSV →").clicked() {
+                                let r = self.rpc("export_flows_csv", serde_json::json!({
+                                    "path": "/tmp/netmon-flows-export.csv"
+                                }));
+                                self.set_rpc_result(r);
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    if rx_hidden > 0 {
+                        ui.colored_label(CLR_MUTED, format!("→ {rx_hidden} RX rows hidden by filter"));
                     }
+                    egui::ScrollArea::vertical()
+                        .id_salt("flows_rx_scroll")
+                        .max_height(520.0)
+                        .show(ui, |ui| {
+                            flow_table_filtered(ui, &rx_filtered, "rx_tbl");
+                        });
+                });
+
+                cols[1].vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        section_header(ui, "TX Flows");
+                        ui.add_space(6.0);
+                        count_badge(ui, tx_filtered.len());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if export_btn(ui, "Export CSV →").clicked() {
+                                let r = self.rpc("export_flows_csv", serde_json::json!({
+                                    "path": "/tmp/netmon-flows-tx-export.csv"
+                                }));
+                                self.set_rpc_result(r);
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    if tx_hidden > 0 {
+                        ui.colored_label(CLR_MUTED, format!("→ {tx_hidden} TX rows hidden by filter"));
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("flows_tx_scroll")
+                        .max_height(520.0)
+                        .show(ui, |ui| {
+                            flow_table_filtered(ui, &tx_filtered, "tx_tbl");
+                        });
                 });
             });
-            ui.add_space(4.0);
-            flow_table_filtered(ui, &rx_filtered, "rx_tbl");
-            if rx_hidden > 0 {
-                ui.colored_label(CLR_MUTED, format!("  → {rx_hidden} more rows filtered"));
-            }
-
-            ui.add_space(16.0);
-
-            // TX section
-            ui.horizontal(|ui| {
-                section_header(ui, "TX Flows");
-                ui.add_space(6.0);
-                count_badge(ui, tx_filtered.len());
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if export_btn(ui, "Export CSV →").clicked() {
-                        let r = self.rpc("export_flows_csv", serde_json::json!({
-                            "path": "/tmp/netmon-flows-tx-export.csv"
-                        }));
-                        self.set_rpc_result(r);
-                    }
-                });
-            });
-            ui.add_space(4.0);
-            flow_table_filtered(ui, &tx_filtered, "tx_tbl");
-            if tx_hidden > 0 {
-                ui.colored_label(CLR_MUTED, format!("  → {tx_hidden} more rows filtered"));
-            }
         });
     }
-}
 
-// ── Processes tab ─────────────────────────────────────────────────────────────
+    fn show_processes(
+        &mut self,
+        ui: &mut Ui,
+        snap: Option<&MonitorSnapshotV1>,
+        recent_procs: &[ProcessTrafficRow],
+        recent_users: &[UserTrafficRow],
+    ) {
+        let Some(snap) = snap else {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("No data yet.").size(16.0).color(CLR_MUTED));
+            });
+            return;
+        };
 
-fn show_processes(
-    ui: &mut Ui,
-    snap: Option<&MonitorSnapshotV1>,
-    recent_procs: &[ProcessTrafficRow],
-    recent_users: &[UserTrafficRow],
-) {
-    let Some(snap) = snap else {
-        ui.centered_and_justified(|ui| {
-            ui.label(RichText::new("No data yet.").size(16.0).color(CLR_MUTED));
-        });
-        return;
-    };
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.colored_label(
+                CLR_MUTED,
+                "Aggregates sum every flow in the snapshot (up to kernel-spy --max-flow-rows per direction). \
+                 The Flows table can list the same rows (capped for UI scroll). \
+                 Recent sightings below are a rolling history across ticks, so a PID may appear there without a visible row in the latest flow list.",
+            );
+            ui.add_space(10.0);
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
         // top two-column
         ui.columns(2, |cols| {
             let ui = &mut cols[0];
@@ -797,7 +983,10 @@ fn show_processes(
             if snap.aggregates_by_pid.is_empty() {
                 ui.colored_label(CLR_MUTED, "No process attribution yet.");
             } else {
-                proc_table_bars(ui, &snap.aggregates_by_pid, "proc_top");
+                proc_table_bars(ui, &snap.aggregates_by_pid, "proc_top", |pid| {
+                    self.flow_filter = format!("pid:{pid}");
+                    self.active_tab = Tab::Flows;
+                });
             }
 
             let ui = &mut cols[1];
@@ -925,11 +1114,45 @@ fn show_processes(
             });
         }
     });
-}
+    }
 
-// ── Audit tab ─────────────────────────────────────────────────────────────────
+    fn show_settings(&mut self, ui: &mut Ui, snap: Option<&MonitorSnapshotV1>) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            section_header(ui, "Interface (kernel-spy)");
+            ui.add_space(8.0);
+            ui.colored_label(
+                CLR_MUTED,
+                "The monitored interface is chosen when kernel-spy starts (CLI -i/--iface or config file). \
+                 Changing it requires restarting kernel-spy on the desired interface.",
+            );
+            ui.add_space(12.0);
+            if let Some(s) = snap {
+                kv_pair(ui, "Active iface", &s.iface);
+                ui.add_space(10.0);
+                let suggested = format!(
+                    "kernel-spy -i {} --export-socket /tmp/ipc-netmon.sock --control-socket /tmp/ipc-netmon-ctl.sock",
+                    s.iface
+                );
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Copy suggested command").color(CLR_ACCENT)).clicked() {
+                        ui.output_mut(|o| o.copied_text = suggested.clone());
+                    }
+                });
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(CLR_CARD)
+                    .stroke(Stroke::new(1.0, CLR_BORDER))
+                    .rounding(Rounding::same(6.0))
+                    .inner_margin(Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(&suggested).monospace().small().color(CLR_TEXT));
+                    });
+            } else {
+                ui.colored_label(CLR_MUTED, "No snapshot yet — start kernel-spy to see iface.");
+            }
+        });
+    }
 
-impl App {
     fn show_audit(&mut self, ui: &mut Ui, snap: Option<&MonitorSnapshotV1>, alert_log: &[AlertEvent]) {
         let Some(snap) = snap else {
             ui.centered_and_justified(|ui| {
@@ -1346,6 +1569,13 @@ fn flow_table_filtered(ui: &mut Ui, rows: &[&FlowRow], id: &str) {
         ui.colored_label(CLR_MUTED, "No flows match.");
         return;
     }
+    let n_total = rows.len();
+    let n_show = n_total.min(FLOW_TABLE_MAX_ROWS);
+    ui.colored_label(
+        CLR_MUTED,
+        format!("Showing {n_show} of {n_total} matching flows (cap {FLOW_TABLE_MAX_ROWS} per table)."),
+    );
+    ui.add_space(4.0);
     egui::Frame::none()
         .fill(CLR_CARD)
         .stroke(Stroke::new(1.0, CLR_BORDER))
@@ -1361,7 +1591,7 @@ fn flow_table_filtered(ui: &mut Ui, rows: &[&FlowRow], id: &str) {
                         ui.label(RichText::new(hdr).small().strong().color(CLR_MUTED));
                     }
                     ui.end_row();
-                    for row in rows.iter().take(100) {
+                    for row in rows.iter().take(FLOW_TABLE_MAX_ROWS) {
                         // protocol badge
                         let pc = proto_color(&row.protocol);
                         egui::Frame::none()
@@ -1387,7 +1617,7 @@ fn flow_table_filtered(ui: &mut Ui, rows: &[&FlowRow], id: &str) {
         });
 }
 
-fn proc_table_bars(ui: &mut Ui, rows: &[ProcessTrafficRow], id_prefix: &str) {
+fn proc_table_bars<F: FnMut(u32)>(ui: &mut Ui, rows: &[ProcessTrafficRow], id_prefix: &str, mut on_flows: F) {
     egui::Frame::none()
         .fill(CLR_CARD)
         .stroke(Stroke::new(1.0, CLR_BORDER))
@@ -1397,12 +1627,16 @@ fn proc_table_bars(ui: &mut Ui, rows: &[ProcessTrafficRow], id_prefix: &str) {
             for (i, row) in rows.iter().take(10).enumerate() {
                 let comm = row.comm.as_deref().unwrap_or("unknown");
                 let frac = (row.share_percent as f32 / 100.0).clamp(0.0, 1.0);
+                let pid = row.pid;
                 ui.push_id(format!("{id_prefix}_{i}"), |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("pid {}", row.pid))
                             .size(11.0).color(CLR_MUTED).monospace());
                         ui.label(RichText::new(comm).color(CLR_ACCENT).size(12.0));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button(RichText::new("Flows").color(CLR_ACCENT)).clicked() {
+                                on_flows(pid);
+                            }
                             ui.label(RichText::new(fmt_bytes(row.bytes_total))
                                 .size(11.5).color(CLR_GREEN));
                         });

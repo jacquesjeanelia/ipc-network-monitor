@@ -73,13 +73,6 @@ fn proc_inode_for_ipv4(meta: &PacketMetadata, table_path: &str) -> Option<u64> {
         Ok(d) => d,
         Err(_) => return None,
     };
-    
-    // Prove we actually entered the function for the packet
-    let is_target = meta.src_port == 80 || meta.dst_port == 80 || meta.src_port == 8888 || meta.dst_port == 8888;
-    if is_target {
-        println!("DEBUG -> Searching {} for Packet (Src: {}, Dst: {})", 
-                 table_path, meta.src_port, meta.dst_port);
-    }
 
     for line in data.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -87,7 +80,6 @@ fn proc_inode_for_ipv4(meta: &PacketMetadata, table_path: &str) -> Option<u64> {
             continue;
         }
         
-        // CRITICAL FIX: Handle parsing errors by skipping the line, NOT aborting the function
         let local = match parse_proc_hex_quad(parts[1]) {
             Some(v) => v,
             None => continue,
@@ -96,10 +88,6 @@ fn proc_inode_for_ipv4(meta: &PacketMetadata, table_path: &str) -> Option<u64> {
             Some(v) => v,
             None => continue,
         };
-
-        if is_target && (local.1 == 80 || remote.1 == 80 || local.1 == 8888 || remote.1 == 8888) {
-            println!("DEBUG -> PROC line parsed: local port={}, remote port={}", local.1, remote.1);
-        }
 
         if !proc_line_matches_meta(meta, local, remote) {
             continue;

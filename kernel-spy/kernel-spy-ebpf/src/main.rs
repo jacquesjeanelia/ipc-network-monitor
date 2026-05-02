@@ -27,6 +27,8 @@ const TC_ACT_SHOT: i32 = 2;
 const IPPROTO_HOPOPTS: u8 = 0;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+const IPPROTO_ICMP: u8 = 1;
+const IPPROTO_ICMPV6: u8 = 58;
 const IPPROTO_ROUTING: u8 = 43;
 const IPPROTO_FRAGMENT: u8 = 44;
 const IPPROTO_ESP: u8 = 50;
@@ -223,6 +225,16 @@ fn parse_packet(data: usize, data_end: usize) -> Result<(PacketMetadata, u64, bo
             src_port = u16::from_be_bytes(src_port_bytes);
             dst_port = u16::from_be_bytes(dst_port_bytes);
         }
+    } else if protocol == IPPROTO_ICMP {
+        // Echo id in src_port; type|code in dst_port for map key variety.
+        if tl_hdr_start + 8 <= data_end {
+            let icmp_type = read_u8(data, tl_hdr_start - data, data_end)?;
+            let icmp_code = read_u8(data, tl_hdr_start - data + 1, data_end)?;
+            if (icmp_type == 8 || icmp_type == 0) && tl_hdr_start + 8 <= data_end {
+                src_port = read_be_u16(data, tl_hdr_start - data + 4, data_end)?;
+            }
+            dst_port = ((icmp_type as u16) << 8) | (icmp_code as u16);
+        }
     }
 
     let metadata = PacketMetadata::new(src_ip, dst_ip, src_port, dst_port, protocol);
@@ -377,6 +389,22 @@ fn parse_packet_v6(data: usize, data_end: usize) -> Result<(PacketMetadataV6, u6
 
         if nh == IPPROTO_ESP {
             return Err(());
+        }
+
+        if nh == IPPROTO_ICMPV6 {
+            if pos + 8 > data_end {
+                return Err(());
+            }
+            let icmp_type = read_u8(data, pos - data, data_end)?;
+            let icmp_code = read_u8(data, pos - data + 1, data_end)?;
+            let mut id16: u16 = 0;
+            if (icmp_type == 128 || icmp_type == 129) && pos + 8 <= data_end {
+                id16 = read_be_u16(data, pos - data + 4, data_end)?;
+            }
+            let code_port = ((icmp_type as u16) << 8) | (icmp_code as u16);
+            let metadata =
+                PacketMetadataV6::new(src_ip, dst_ip, id16, code_port, IPPROTO_ICMPV6);
+            return Ok((metadata, packet_size, drop_packet));
         }
 
         return Err(());
