@@ -1,5 +1,8 @@
-//! best-effort pid correlation: read `/proc/net/tcp` and `/proc/net/udp` (and ipv6 tables), then
-//! one `/proc/*/fd` scan per tick to map socket inode -> pid
+//! Best-effort **TCP/UDP process** correlation on Linux using **only `/proc`** for the primary path:
+//! read `/proc/net/tcp`, `/proc/net/tcp6`, `/proc/net/udp`, and `/proc/net/udp6` to find the **socket inode**
+//! matching the flow’s 5-tuple, then one **`/proc/*/fd`** walk per tick to map `socket:[inode]` → **PID**.
+//! User names on exported flow rows are filled separately from **`/proc/<pid>/status`** (`Uid:`)
+//! once a PID is known (see `attr::enrich_flow_rows`).
 
 use std::collections::HashMap;
 use std::fs;

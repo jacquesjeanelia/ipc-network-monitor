@@ -1,4 +1,4 @@
-//! look up uid/username from a local pid via `/proc` and passwd maps
+//! Resolve **UID / username** for a known local PID using **`/proc/<pid>/status`** (`Uid:` real id) and the system user database.
 
 use std::collections::HashMap;
 

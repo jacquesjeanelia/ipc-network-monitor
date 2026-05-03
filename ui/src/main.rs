@@ -23,22 +23,25 @@ const MAX_ALERT_LOG: usize = 500;
 /// Show all flows present in the snapshot (server caps with `--max-flow-rows`).
 const FLOW_TABLE_MAX_ROWS: usize = 512;
 
-// ── palette ─────────────────────────────────────────────────────────────────
+// ── palette (VS Code–style dark: near-white text, blue accents, gray chrome) ─
 
-const CLR_BG: Color32         = Color32::from_rgb(0x0f, 0x11, 0x17);
-const CLR_PANEL: Color32      = Color32::from_rgb(0x16, 0x1a, 0x26);
-const CLR_CARD: Color32       = Color32::from_rgb(0x1e, 0x23, 0x33);
-const CLR_BORDER: Color32     = Color32::from_rgb(0x2a, 0x31, 0x44);
-const CLR_TEXT: Color32       = Color32::from_rgb(0xe0, 0xe4, 0xf0);
-const CLR_MUTED: Color32      = Color32::from_rgb(0x70, 0x7a, 0x99);
-const CLR_ACCENT: Color32     = Color32::from_rgb(0x4e, 0x9f, 0xff);
-const CLR_GREEN: Color32      = Color32::from_rgb(0x3d, 0xd6, 0x8c);
-const CLR_YELLOW: Color32     = Color32::from_rgb(0xf5, 0xc5, 0x18);
-const CLR_RED: Color32        = Color32::from_rgb(0xf0, 0x4f, 0x4f);
-const CLR_ORANGE: Color32     = Color32::from_rgb(0xff, 0x8c, 0x30);
-const CLR_BLUE_LIGHT: Color32 = Color32::from_rgb(0x60, 0xb8, 0xff);
-const CLR_PURPLE: Color32     = Color32::from_rgb(0xb0, 0x7e, 0xff);
-const SIDEBAR_W: f32 = 160.0;
+const CLR_BG: Color32         = Color32::from_rgb(0x1e, 0x1e, 0x1e);
+const CLR_PANEL: Color32      = Color32::from_rgb(0x25, 0x25, 0x26);
+const CLR_CARD: Color32       = Color32::from_rgb(0x2d, 0x2d, 0x30);
+const CLR_BORDER: Color32     = Color32::from_rgb(0x3e, 0x3e, 0x42);
+const CLR_TEXT: Color32       = Color32::from_rgb(0xcc, 0xcc, 0xcc);
+const CLR_TEXT_BRIGHT: Color32 = Color32::from_rgb(0xf3, 0xf3, 0xf3);
+const CLR_MUTED: Color32      = Color32::from_rgb(0x85, 0x85, 0x85);
+const CLR_ACCENT: Color32     = Color32::from_rgb(0x37, 0x94, 0xff);
+const CLR_GREEN: Color32      = Color32::from_rgb(0x4e, 0xc9, 0xb0);
+const CLR_YELLOW: Color32     = Color32::from_rgb(0xd7, 0xba, 0x0d);
+const CLR_RED: Color32        = Color32::from_rgb(0xf4, 0x87, 0x71);
+const CLR_ORANGE: Color32     = Color32::from_rgb(0xce, 0x91, 0x78);
+const CLR_BLUE_LIGHT: Color32 = Color32::from_rgb(0x75, 0xbe, 0xff);
+const CLR_BLUE_MID: Color32   = Color32::from_rgb(0x56, 0x9c, 0xd6);
+const CLR_BLUE_DIM: Color32   = Color32::from_rgb(0x3c, 0x6e, 0x9c);
+const CLR_PURPLE: Color32     = Color32::from_rgb(0x6a, 0x8c, 0xc8);
+const SIDEBAR_W: f32 = 184.0;
 
 // ── formatting ───────────────────────────────────────────────────────────────
 
@@ -101,7 +104,7 @@ fn flow_attribution_hover(row: &FlowRow) -> Option<&'static str> {
             "ICMP/IGMP are not in /proc/net/tcp or UDP. There is no per-flow PID in the standard Linux APIs for these protocols."
         }
         "TCP" | "UDP" => {
-            "No match in /proc inode scan, eBPF sport map, or merged ss(8) output. If traffic belongs to another network namespace (Docker, rootless, VM bridge), restart kernel-spy with --ss-netns <linux-netns-name> so ss is run inside that namespace as well. Run kernel-spy with privileges if ss -p is denied."
+            "No match from the Linux /proc pipeline: 5-tuple in /proc/net/tcp|tcp6|udp|udp6 → socket inode → owning PID via /proc/*/fd → optional ss(8); user comes from /proc/PID/status (Uid:) when PID is known. Also tries the eBPF sport map. If traffic is in another netns, run kernel-spy with --ss-netns <name>. Use privileges if ss -p is denied."
         }
         _ => "No standard socket-based attribution for this protocol.",
     })
@@ -117,10 +120,10 @@ fn alert_color(severity: &str) -> Color32 {
 
 fn proto_color(proto: &str) -> Color32 {
     match proto {
-        "TCP" => CLR_BLUE_LIGHT,
-        "UDP" => CLR_YELLOW,
-        "ICMP" | "ICMPv6" => CLR_PURPLE,
-        "IGMP" | "GRE" | "SCTP" | "ESP" | "AH" => CLR_ORANGE,
+        "TCP" => CLR_ACCENT,
+        "UDP" => CLR_BLUE_MID,
+        "ICMP" | "ICMPv6" => CLR_BLUE_DIM,
+        "IGMP" | "GRE" | "SCTP" | "ESP" | "AH" => CLR_PURPLE,
         _ => CLR_MUTED,
     }
 }
@@ -354,30 +357,31 @@ fn setup_visuals(ctx: &egui::Context) {
     v.window_fill          = CLR_CARD;
     v.extreme_bg_color     = CLR_BG;
     v.faint_bg_color       = CLR_CARD;
-    v.code_bg_color        = Color32::from_rgb(0x12, 0x16, 0x20);
+    v.code_bg_color        = Color32::from_rgb(0x1e, 0x1e, 0x1e);
     v.window_stroke        = Stroke::new(1.0, CLR_BORDER);
     v.widgets.noninteractive.bg_fill   = CLR_CARD;
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, CLR_TEXT);
-    v.widgets.inactive.bg_fill         = Color32::from_rgb(0x25, 0x2c, 0x40);
-    v.widgets.inactive.fg_stroke       = Stroke::new(1.0, CLR_TEXT);
-    v.widgets.hovered.bg_fill          = Color32::from_rgb(0x2e, 0x37, 0x50);
-    v.widgets.active.bg_fill           = Color32::from_rgb(0x1a, 0x7a, 0x99);
-    v.selection.bg_fill                = Color32::from_rgba_premultiplied(0x4e, 0x9f, 0xdd, 0x60);
-    v.widgets.noninteractive.rounding  = Rounding::same(6.0);
-    v.widgets.inactive.rounding        = Rounding::same(6.0);
-    v.widgets.hovered.rounding         = Rounding::same(6.0);
-    v.widgets.active.rounding          = Rounding::same(6.0);
+    v.widgets.inactive.bg_fill         = Color32::from_rgb(0x3c, 0x3c, 0x3c);
+    v.widgets.inactive.fg_stroke       = Stroke::new(1.0, CLR_TEXT_BRIGHT);
+    v.widgets.hovered.bg_fill          = Color32::from_rgb(0x2a, 0x2d, 0x2e);
+    v.widgets.active.bg_fill           = Color32::from_rgb(0x09, 0x47, 0x71);
+    v.selection.bg_fill                = Color32::from_rgba_premultiplied(0x26, 0x88, 0xf2, 0x55);
+    v.hyperlink_color                    = CLR_ACCENT;
+    v.widgets.noninteractive.rounding  = Rounding::same(4.0);
+    v.widgets.inactive.rounding        = Rounding::same(4.0);
+    v.widgets.hovered.rounding         = Rounding::same(4.0);
+    v.widgets.active.rounding          = Rounding::same(4.0);
     ctx.set_visuals(v);
 
     use egui::FontFamily::{Monospace, Proportional};
     let mut style = (*ctx.style()).clone();
-    style.text_styles.insert(egui::TextStyle::Body,      FontId::new(13.5, Proportional));
-    style.text_styles.insert(egui::TextStyle::Heading,   FontId::new(17.0, Proportional));
-    style.text_styles.insert(egui::TextStyle::Monospace, FontId::new(12.5, Monospace));
-    style.text_styles.insert(egui::TextStyle::Small,     FontId::new(11.0, Proportional));
-    style.text_styles.insert(egui::TextStyle::Button,    FontId::new(13.0, Proportional));
-    style.spacing.item_spacing   = Vec2::new(8.0, 6.0);
-    style.spacing.button_padding = Vec2::new(10.0, 5.0);
+    style.text_styles.insert(egui::TextStyle::Body,      FontId::new(14.5, Proportional));
+    style.text_styles.insert(egui::TextStyle::Heading,   FontId::new(19.0, Proportional));
+    style.text_styles.insert(egui::TextStyle::Monospace, FontId::new(13.0, Monospace));
+    style.text_styles.insert(egui::TextStyle::Small,     FontId::new(11.5, Proportional));
+    style.text_styles.insert(egui::TextStyle::Button,    FontId::new(13.5, Proportional));
+    style.spacing.item_spacing   = Vec2::new(10.0, 7.0);
+    style.spacing.button_padding = Vec2::new(12.0, 6.0);
     ctx.set_style(style);
 }
 
@@ -412,13 +416,13 @@ impl eframe::App for App {
 
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new("⬡").size(30.0).color(CLR_ACCENT));
-                    ui.label(RichText::new("NetMon").size(15.5).strong().color(CLR_TEXT));
+                    ui.label(RichText::new("NetMon").size(15.5).strong().color(CLR_TEXT_BRIGHT));
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         ui.add_space(20.0);
                         if connected {
-                            ui.colored_label(CLR_GREEN, "●");
-                            ui.label(RichText::new("LIVE").size(11.0).color(CLR_GREEN).strong());
+                            ui.colored_label(CLR_ACCENT, "●");
+                            ui.label(RichText::new("LIVE").size(11.0).color(CLR_ACCENT).strong());
                         } else {
                             ui.colored_label(CLR_RED, "●");
                             ui.label(RichText::new("Offline").size(11.0).color(CLR_RED));
@@ -441,7 +445,11 @@ impl eframe::App for App {
 
                 for &(tab, icon, label) in entries {
                     let selected = self.active_tab == tab;
-                    let bg = if selected { Color32::from_rgb(0x1a, 0x20, 0x35) } else { Color32::TRANSPARENT };
+                    let bg = if selected {
+                        Color32::from_rgb(0x37, 0x37, 0x3d)
+                    } else {
+                        Color32::TRANSPARENT
+                    };
                     let text_color = if selected { CLR_ACCENT } else { CLR_MUTED };
 
                     let full_label = format!("  {icon}  {label}");
@@ -519,7 +527,7 @@ impl eframe::App for App {
                         Tab::Control    => "Policy Control",
                         Tab::Settings   => "Settings",
                     };
-                    ui.label(RichText::new(tab_name).size(15.0).strong().color(CLR_TEXT));
+                    ui.label(RichText::new(tab_name).size(16.0).strong().color(CLR_TEXT_BRIGHT));
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(ref s) = snap {
@@ -542,7 +550,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::none()
                 .fill(CLR_BG)
-                .inner_margin(Margin::same(16.0)))
+                .inner_margin(Margin::same(20.0)))
             .show(ctx, |ui| {
                 match self.active_tab {
                     Tab::Dashboard  => self.show_dashboard(ui, snap.as_ref(), &rx_hist, &tx_hist, &port_hist, &proto_hist),
@@ -609,8 +617,8 @@ impl App {
 
         // ── two-column layout ─────────────────────────────────────────
         let avail = ui.available_width();
-        let left_w  = avail * 0.44;
-        let right_w = avail * 0.54;
+        let left_w  = avail * 0.42;
+        let right_w = avail * 0.56;
 
         ui.horizontal_top(|ui| {
             // ── LEFT COLUMN ──────────────────────────────────────────
@@ -621,9 +629,9 @@ impl App {
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
                         big_stat(ui, "↓ RX Pkts",   &snap.rx.packets.to_string(), CLR_BLUE_LIGHT);
-                        big_stat(ui, "↓ RX Bytes",  &fmt_bytes(snap.rx.bytes),    CLR_GREEN);
-                        big_stat(ui, "↑ TX Pkts",   &snap.tx.packets.to_string(), CLR_ORANGE);
-                        big_stat(ui, "↑ TX Bytes",  &fmt_bytes(snap.tx.bytes),    CLR_RED);
+                        big_stat(ui, "↓ RX Bytes",  &fmt_bytes(snap.rx.bytes),    CLR_ACCENT);
+                        big_stat(ui, "↑ TX Pkts",   &snap.tx.packets.to_string(), CLR_BLUE_MID);
+                        big_stat(ui, "↑ TX Bytes",  &fmt_bytes(snap.tx.bytes),    CLR_BLUE_LIGHT);
                     });
 
                     ui.add_space(14.0);
@@ -667,19 +675,19 @@ impl App {
                         .show(ui, |ui| {
                             proto_bar(ui, "TCP",     cl.tcp_bytes,    proto_total, CLR_BLUE_LIGHT);
                             ui.add_space(4.0);
-                            proto_bar(ui, "UDP",     cl.udp_bytes,    proto_total, CLR_YELLOW);
+                            proto_bar(ui, "UDP",     cl.udp_bytes,    proto_total, CLR_BLUE_MID);
                             ui.add_space(4.0);
-                            proto_bar(ui, "ICMP",    cl.icmp_bytes,   proto_total, CLR_PURPLE);
+                            proto_bar(ui, "ICMP",    cl.icmp_bytes,   proto_total, CLR_BLUE_DIM);
                             ui.add_space(4.0);
-                            proto_bar(ui, "ICMPv6",  cl.icmpv6_bytes, proto_total, CLR_PURPLE);
+                            proto_bar(ui, "ICMPv6",  cl.icmpv6_bytes, proto_total, CLR_BLUE_DIM);
                             ui.add_space(4.0);
-                            proto_bar(ui, "IGMP",    cl.igmp_bytes,   proto_total, CLR_ORANGE);
+                            proto_bar(ui, "IGMP",    cl.igmp_bytes,   proto_total, CLR_PURPLE);
                             ui.add_space(4.0);
-                            proto_bar(ui, "GRE",     cl.gre_bytes,    proto_total, CLR_ORANGE);
+                            proto_bar(ui, "GRE",     cl.gre_bytes,    proto_total, CLR_PURPLE);
                             ui.add_space(4.0);
-                            proto_bar(ui, "SCTP",    cl.sctp_bytes,   proto_total, CLR_ORANGE);
+                            proto_bar(ui, "SCTP",    cl.sctp_bytes,   proto_total, CLR_PURPLE);
                             ui.add_space(4.0);
-                            proto_bar(ui, "ESP",     cl.esp_bytes,    proto_total, CLR_MUTED);
+                            proto_bar(ui, "ESP",     cl.esp_bytes,    proto_total, CLR_ORANGE);
                             ui.add_space(4.0);
                             proto_bar(ui, "AH",      cl.ah_bytes,     proto_total, CLR_MUTED);
                             ui.add_space(4.0);
@@ -710,9 +718,9 @@ impl App {
                     let tx_rate = tx_hist.last().map(|p| p[1]).unwrap_or(0.0);
                     let port_rate = port_hist.last().map(|p| p[1]).unwrap_or(0.0);
                     ui.horizontal(|ui| {
-                        rate_badge(ui, "↓ RX", rx_rate, CLR_GREEN);
+                        rate_badge(ui, "↓ RX", rx_rate, CLR_BLUE_LIGHT);
                         ui.add_space(8.0);
-                        rate_badge(ui, "↑ TX", tx_rate, CLR_ORANGE);
+                        rate_badge(ui, "↑ TX", tx_rate, CLR_ACCENT);
                         if sel_port.is_some() {
                             ui.add_space(8.0);
                             rate_badge(ui, "Port Σ", port_rate, CLR_BLUE_LIGHT);
@@ -747,7 +755,7 @@ impl App {
                         .inner_margin(Margin::same(8.0))
                         .show(ui, |ui| {
                             Plot::new("throughput")
-                                .height(220.0)
+                                .height(300.0)
                                 .include_y(0.0)
                                 .legend(Legend::default())
                                 .x_axis_label("Elapsed (s)")
@@ -755,11 +763,11 @@ impl App {
                                 .show(ui, |pui| {
                                     if !rx_hist.is_empty() {
                                         pui.line(Line::new(PlotPoints::new(rx_hist.to_vec()))
-                                            .color(CLR_GREEN).name("RX (B/s)").width(2.0));
+                                            .color(CLR_BLUE_LIGHT).name("RX (B/s)").width(2.0));
                                     }
                                     if !tx_hist.is_empty() {
                                         pui.line(Line::new(PlotPoints::new(tx_hist.to_vec()))
-                                            .color(CLR_ORANGE).name("TX (B/s)").width(2.0));
+                                            .color(CLR_ACCENT).name("TX (B/s)").width(2.0));
                                     }
                                     if sel_port.is_some() && !port_hist.is_empty() {
                                         let name = format!(
@@ -784,7 +792,7 @@ impl App {
                         .inner_margin(Margin::same(8.0))
                         .show(ui, |ui| {
                             Plot::new("proto_breakdown")
-                                .height(160.0)
+                                .height(220.0)
                                 .include_y(0.0)
                                 .legend(Legend::default())
                                 .x_axis_label("Elapsed (s)")
@@ -813,11 +821,11 @@ impl App {
                                         pui.line(Line::new(PlotPoints::new(tcp_pts))
                                             .color(CLR_BLUE_LIGHT).name("TCP").width(1.5));
                                         pui.line(Line::new(PlotPoints::new(udp_pts))
-                                            .color(CLR_YELLOW).name("UDP").width(1.5));
+                                            .color(CLR_BLUE_MID).name("UDP").width(1.5));
                                         pui.line(Line::new(PlotPoints::new(icmp_pts))
-                                            .color(CLR_PURPLE).name("ICMP").width(1.5));
+                                            .color(CLR_BLUE_DIM).name("ICMP").width(1.5));
                                         pui.line(Line::new(PlotPoints::new(icmpv6_pts))
-                                            .color(Color32::from_rgb(0xd4, 0x8a, 0xff)).name("ICMPv6").width(1.5));
+                                            .color(CLR_PURPLE).name("ICMPv6").width(1.5));
                                         pui.line(Line::new(PlotPoints::new(rest_pts))
                                             .color(CLR_MUTED).name("Other L4+").width(1.2));
                                     }
@@ -851,7 +859,7 @@ impl App {
                                             ).size(11.0).color(CLR_MUTED));
                                             ui.add_space(4.0);
                                             ui.label(RichText::new(fmt_bytes(row.bytes_total))
-                                                .size(11.5).color(CLR_GREEN));
+                                                .size(11.5).color(CLR_BLUE_LIGHT));
                                         });
                                     });
                                     let frac = (row.share_percent as f32 / 100.0).clamp(0.0, 1.0);
@@ -872,6 +880,7 @@ impl App {
     }
 
     fn show_flows(&mut self, ui: &mut Ui, snap: Option<&MonitorSnapshotV1>) {
+        let flow_scroll_h = (ui.ctx().screen_rect().height() * 0.50).clamp(420.0, 820.0);
         let Some(snap) = snap else {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("No data yet.").size(16.0).color(CLR_MUTED));
@@ -885,7 +894,7 @@ impl App {
                 ui.label(RichText::new("🔍").size(14.0));
                 ui.add(egui::TextEdit::singleline(&mut self.flow_filter)
                     .hint_text("Filter: IP, port, protocol, user — or pid:1234 …")
-                    .desired_width(420.0));
+                    .desired_width(520.0));
                 if !self.flow_filter.is_empty() {
                     if styled_btn(ui, "✕ Clear").clicked() {
                         self.flow_filter.clear();
@@ -894,14 +903,15 @@ impl App {
             });
             ui.add_space(8.0);
             egui::CollapsingHeader::new(
-                RichText::new("Process column: “—” vs “L3 · no socket”").strong().size(12.0),
+                RichText::new("Attribution: /proc vs L3-only protocols").strong().size(12.0),
             )
             .default_open(false)
             .show(ui, |ui| {
                 ui.label(RichText::new(
-                    "• TCP/UDP: needs a match in /proc, the eBPF sport map, or ss (host + optional --ss-netns).\n\
-                     • ICMP / similar: not in /proc sockets — label shows L3 · no socket.\n\
-                     • Settings tab has copy-paste hints for iface and netns.",
+                    "• TCP/UDP (kernel-spy): match the flow to a line in /proc/net/tcp, tcp6, udp, or udp6 → read socket inode → resolve owning PID by scanning /proc/<pid>/fd for socket:[inode]; then /proc/<pid>/status (Uid:) plus passwd maps the user on each FlowRow.\n\
+                     • Fallbacks: eBPF local-TCP-sport map, then merged ss -p output (see --ss-netns).\n\
+                     • ICMP / similar: not in those /proc tables — label shows L3 · no socket.\n\
+                     • Settings has iface / netns copy-paste hints.",
                 ).size(11.0).color(CLR_MUTED));
             });
             ui.add_space(10.0);
@@ -964,7 +974,7 @@ impl App {
                     }
                     egui::ScrollArea::vertical()
                         .id_salt("flows_rx_scroll")
-                        .max_height(520.0)
+                        .max_height(flow_scroll_h)
                         .show(ui, |ui| {
                             flow_table_filtered(ui, &rx_filtered, "rx_tbl");
                         });
@@ -990,7 +1000,7 @@ impl App {
                     }
                     egui::ScrollArea::vertical()
                         .id_salt("flows_tx_scroll")
-                        .max_height(520.0)
+                        .max_height(flow_scroll_h)
                         .show(ui, |ui| {
                             flow_table_filtered(ui, &tx_filtered, "tx_tbl");
                         });
@@ -1020,6 +1030,18 @@ impl App {
                  The Flows table can list the same rows (capped for UI scroll). \
                  Recent sightings below are a rolling history across ticks, so a PID may appear there without a visible row in the latest flow list.",
             );
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new(
+                RichText::new("How TCP/UDP maps to process and user (Linux /proc)").strong().size(12.0),
+            )
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(RichText::new(
+                    "1. /proc/net/tcp and /proc/net/tcp6 list local and remote endpoints plus a socket inode for each ESTABLISHED (and related) row; UDP uses /proc/net/udp and udp6.\n\
+                     2. kernel-spy walks /proc/<pid>/fd and resolves socket:[<inode>] symlinks to learn which PID owns that inode.\n\
+                     3. With a PID, it reads /proc/<pid>/status (Uid: line) and resolves the username from the system user database — that populates per-flow user fields and the user aggregates here.",
+                ).size(11.0).color(CLR_MUTED));
+            });
             ui.add_space(10.0);
 
         // top two-column
@@ -1073,7 +1095,7 @@ impl App {
                                     RichText::new(row.comm.as_deref().unwrap_or("—")).size(12.0));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.label(RichText::new(fmt_bytes(row.bytes_total))
-                                        .size(11.5).color(CLR_GREEN));
+                                        .size(11.5).color(CLR_BLUE_LIGHT));
                                 });
                             });
                         }
@@ -1103,7 +1125,7 @@ impl App {
                                     RichText::new(row.username.as_deref().unwrap_or("—")).size(12.0));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.label(RichText::new(fmt_bytes(row.bytes_total))
-                                        .size(11.5).color(CLR_GREEN));
+                                        .size(11.5).color(CLR_BLUE_LIGHT));
                                 });
                             });
                         }
@@ -1131,7 +1153,7 @@ impl App {
                                 ui.colored_label(CLR_ACCENT,
                                     RichText::new(row.comm.as_deref().unwrap_or("—")).size(11.5));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.colored_label(CLR_GREEN,
+                                    ui.colored_label(CLR_BLUE_LIGHT,
                                         RichText::new(fmt_bytes(row.bytes_total)).size(11.5));
                                 });
                             });
@@ -1152,7 +1174,7 @@ impl App {
                                 ui.colored_label(CLR_ACCENT,
                                     RichText::new(row.username.as_deref().unwrap_or("—")).size(11.5));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.colored_label(CLR_GREEN,
+                                    ui.colored_label(CLR_BLUE_LIGHT,
                                         RichText::new(fmt_bytes(row.bytes_total)).size(11.5));
                                 });
                             });
@@ -1176,12 +1198,12 @@ impl App {
             if let Some(s) = snap {
                 kv_pair(ui, "Active iface", &s.iface);
                 ui.add_space(10.0);
-                section_header(ui, "Process attribution (TCP/UDP)");
+                section_header(ui, "Process & user attribution (TCP/UDP via /proc)");
                 ui.add_space(4.0);
                 ui.label(RichText::new(
-                    "If the Flows tab shows “—” for TCP/UDP while traffic is from a container or netns, run kernel-spy with \
-                     --ss-netns <name> so ss merges sockets from `ip netns exec <name> ss …` with the host ss output. \
-                     Example netns names: check `ip netns list` or your container runtime docs.",
+                    "By default, kernel-spy correlates sockets using /proc/net/tcp|tcp6|udp|udp6, inode → /proc/*/fd, then \
+                     /proc/<pid>/status for Uid. If the Flows tab shows “—” while traffic is in another network namespace, run kernel-spy with \
+                     --ss-netns <name> so ss merges `ip netns exec <name> ss …` with the host. Check `ip netns list` or your runtime docs for names.",
                 ).size(11.0).color(CLR_MUTED));
                 ui.add_space(10.0);
                 let suggested = format!(
@@ -1286,7 +1308,9 @@ impl App {
                     .rounding(Rounding::same(8.0))
                     .inner_margin(Margin::same(8.0))
                     .show(ui, |ui| {
-                        egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height((ui.ctx().screen_rect().height() * 0.38).clamp(280.0, 560.0))
+                            .show(ui, |ui| {
                             egui::Grid::new("audit_grid")
                                 .num_columns(4)
                                 .striped(true)
@@ -1460,7 +1484,7 @@ impl App {
                 ui.colored_label(status_color, RichText::new(status_label).strong());
                 ui.add_space(4.0);
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(0x12, 0x16, 0x20))
+                    .fill(Color32::from_rgb(0x1e, 0x1e, 0x1e))
                     .stroke(Stroke::new(1.0, CLR_BORDER))
                     .rounding(Rounding::same(6.0))
                     .inner_margin(Margin::same(10.0))
@@ -1481,7 +1505,7 @@ impl App {
 
 fn section_header(ui: &mut Ui, text: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(text).size(14.0).strong().color(CLR_TEXT));
+        ui.label(RichText::new(text).size(14.5).strong().color(CLR_TEXT_BRIGHT));
         let rect = ui.available_rect_before_wrap();
         let y = rect.min.y + 9.0;
         ui.painter().line_segment(
@@ -1498,11 +1522,11 @@ fn big_stat(ui: &mut Ui, label: &str, value: &str, value_color: Color32) {
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::same(12.0))
         .show(ui, |ui| {
-            ui.set_min_width(140.0);
+            ui.set_min_width(168.0);
             ui.vertical(|ui| {
-                ui.label(RichText::new(label).size(11.0).color(CLR_MUTED));
+                ui.label(RichText::new(label).size(11.5).color(CLR_MUTED));
                 ui.add_space(4.0);
-                ui.label(RichText::new(value).size(22.0).strong().color(value_color));
+                ui.label(RichText::new(value).size(24.0).strong().color(value_color));
             });
         });
 }
@@ -1672,7 +1696,7 @@ fn flow_table_filtered(ui: &mut Ui, rows: &[&FlowRow], id: &str) {
                         ui.label(RichText::new(
                             format!("{}:{}", row.dst_ip, row.dst_port)
                         ).monospace().small().color(CLR_TEXT));
-                        ui.label(RichText::new(fmt_bytes(row.bytes)).small().color(CLR_GREEN));
+                        ui.label(RichText::new(fmt_bytes(row.bytes)).small().color(CLR_BLUE_LIGHT));
                         let ar = flow_attribution_rich_text(row);
                         let resp = ui.add(egui::Label::new(ar));
                         if let Some(tip) = flow_attribution_hover(row) {
@@ -1705,7 +1729,7 @@ fn proc_table_bars<F: FnMut(u32)>(ui: &mut Ui, rows: &[ProcessTrafficRow], id_pr
                                 on_flows(pid);
                             }
                             ui.label(RichText::new(fmt_bytes(row.bytes_total))
-                                .size(11.5).color(CLR_GREEN));
+                                .size(11.5).color(CLR_BLUE_LIGHT));
                         });
                     });
                     ui.add(egui::ProgressBar::new(frac)
@@ -1734,12 +1758,12 @@ fn user_table_bars(ui: &mut Ui, rows: &[UserTrafficRow], id_prefix: &str) {
                         ui.label(RichText::new(uname).color(CLR_ACCENT).size(12.0));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(RichText::new(fmt_bytes(row.bytes_total))
-                                .size(11.5).color(CLR_GREEN));
+                                .size(11.5).color(CLR_BLUE_LIGHT));
                         });
                     });
                     ui.add(egui::ProgressBar::new(frac)
                         .desired_width(ui.available_width())
-                        .fill(CLR_GREEN));
+                        .fill(CLR_ACCENT));
                     if i < rows.len().saturating_sub(1) { ui.add_space(6.0); }
                 });
             }
@@ -1760,10 +1784,10 @@ fn control_section(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui)) {
 }
 
 fn styled_btn(ui: &mut Ui, label: &str) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(label).color(CLR_TEXT))
-        .fill(Color32::from_rgb(0x25, 0x2c, 0x44))
+    ui.add(egui::Button::new(RichText::new(label).color(CLR_TEXT_BRIGHT))
+        .fill(Color32::from_rgb(0x3c, 0x3c, 0x3c))
         .stroke(Stroke::new(1.0, CLR_BORDER))
-        .rounding(Rounding::same(6.0)))
+        .rounding(Rounding::same(4.0)))
 }
 
 fn danger_btn(ui: &mut Ui, label: &str) -> egui::Response {
@@ -1809,7 +1833,8 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1440.0, 900.0])
+            .with_inner_size([1680.0, 1050.0])
+            .with_min_inner_size([1180.0, 720.0])
             .with_title("IPC Network Monitor"),
         ..Default::default()
     };

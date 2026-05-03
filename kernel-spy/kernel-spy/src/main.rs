@@ -264,6 +264,15 @@ async fn main() -> anyhow::Result<()> {
     let mut tc_egress_attached = false;
     let mut tcp_retransmit_trace_attached = false;
 
+    if !netdev::iface_exists(&iface) {
+        let msg = format!(
+            "iface {iface:?} is missing under /sys/class/net — eBPF will not count traffic on that name. \
+             Many desktops use enp*/wlp*/wlan0, not eth0; pick the device from your default route (e.g. `ip route get 1.1.1.1`) and pass `-i` / `--iface`."
+        );
+        warn!("{msg}");
+        probe_errors.push(msg);
+    }
+
     if force_attach_fail {
         probe_errors.push("forced attach failure via KSPY_FORCE_ATTACH_FAIL".into());
     } else {

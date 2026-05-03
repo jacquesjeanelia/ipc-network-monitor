@@ -1,6 +1,12 @@
 //! Sysfs-based interface drop counters (userspace health).
 
 use std::fs;
+use std::path::Path;
+
+/// True if `iface` is a real device the kernel exposes (XDP/TC attach target).
+pub fn iface_exists(iface: &str) -> bool {
+    Path::new(&format!("/sys/class/net/{iface}")).is_dir()
+}
 
 pub fn read_netdev_drops(iface: &str) -> std::io::Result<(Option<u64>, Option<u64>)> {
     let base = format!("/sys/class/net/{iface}/statistics");
