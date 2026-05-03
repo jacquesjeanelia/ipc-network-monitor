@@ -40,6 +40,7 @@ pub fn snapshot_flows_to_csv(snapshot: &MonitorSnapshotV1) -> anyhow::Result<Str
             "local_pid",
             "local_uid",
             "local_username",
+            "local_comm",
         ],
     )?;
 
@@ -71,6 +72,7 @@ pub fn session_flows_to_csv(snaps: &[MonitorSnapshotV1]) -> anyhow::Result<Strin
             "local_pid",
             "local_uid",
             "local_username",
+            "local_comm",
         ],
     )?;
 
@@ -108,6 +110,7 @@ fn write_flow_row(
             opt_u32(flow.local_pid),
             opt_u32(flow.local_uid),
             opt_str(flow.local_username.as_deref()).to_string(),
+            opt_str(flow.local_comm.as_deref()).to_string(),
         ])
         .context("write flow csv row")
 }
@@ -272,6 +275,7 @@ mod tests {
                 local_pid: Some(1),
                 local_uid: Some(1000),
                 local_username: Some("alice".into()),
+                local_comm: Some("curl".into()),
             }],
             flows_tx: vec![],
             probe_status: Default::default(),
@@ -280,12 +284,18 @@ mod tests {
                 pid: 1,
                 comm: Some("curl".into()),
                 bytes_total: 99,
+                ts_unix_ms: 42,
+                share_percent: 100.0,
             }],
             aggregates_by_user: vec![UserTrafficRow {
                 uid: 1000,
                 username: Some("alice".into()),
                 bytes_total: 99,
+                ts_unix_ms: 42,
+                share_percent: 100.0,
             }],
+            aggregate_history_by_pid: vec![],
+            aggregate_history_by_user: vec![],
             alerts: vec![AlertEvent {
                 ts_unix_ms: 42,
                 kind: "spike".into(),
@@ -312,7 +322,7 @@ mod tests {
     fn flows_csv_has_header_and_rows() {
         let csv = snapshot_flows_to_csv(&snapshot()).expect("csv");
         assert!(csv.contains("timestamp_ms,interface,direction,src_ip"));
-        assert!(csv.contains("42,eth0,rx,10.0.0.1,1234,8.8.8.8,53,UDP,99,1,1000,alice"));
+        assert!(csv.contains("42,eth0,rx,10.0.0.1,1234,8.8.8.8,53,UDP,99,1,1000,alice,curl"));
     }
 
     #[test]
@@ -341,8 +351,8 @@ mod tests {
         let snaps = vec![snapshot(), second_snapshot()];
 
         let flows = session_flows_to_csv(&snaps).expect("csv");
-        assert!(flows.contains("42,eth0,rx,10.0.0.1,1234,8.8.8.8,53,UDP,99,1,1000,alice"));
-        assert!(flows.contains("99,wlan0,rx,10.0.0.2,1234,8.8.8.8,53,UDP,99,1,1000,alice"));
+        assert!(flows.contains("42,eth0,rx,10.0.0.1,1234,8.8.8.8,53,UDP,99,1,1000,alice,curl"));
+        assert!(flows.contains("99,wlan0,rx,10.0.0.2,1234,8.8.8.8,53,UDP,99,1,1000,alice,curl"));
 
         let processes = session_processes_to_csv(&snaps).expect("csv");
         assert!(processes.contains("42,1,curl,99"));

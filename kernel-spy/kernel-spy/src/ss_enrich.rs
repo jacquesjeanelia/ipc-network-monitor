@@ -291,6 +291,7 @@ mod tests {
             local_pid: None,
             local_uid: None,
             local_username: None,
+            local_comm: None,
         };
         let ss = SsRow {
             proto: 17,
@@ -332,6 +333,7 @@ mod tests {
             local_pid: None,
             local_uid: None,
             local_username: None,
+            local_comm: None,
         }];
         let ss = SsRow {
             proto: 6,

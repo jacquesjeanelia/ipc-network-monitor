@@ -126,6 +126,7 @@ fn collect_flow_rows<T: Borrow<MapData>>(
             local_pid,
             local_uid: None,
             local_username: None,
+            local_comm: None,
         });
     }
     Ok(out)
@@ -159,6 +160,7 @@ fn collect_flow_rows_v6<T: Borrow<MapData>>(
             local_pid,
             local_uid: None,
             local_username: None,
+            local_comm: None,
         });
     }
     Ok(out)
@@ -674,13 +676,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                     if let Some((pid, comm)) = proc_corr::pid_comm_from_ebpf_map(p, smap) {
                         row.local_pid = Some(pid);
-                        if row.local_username.is_none() {
-                            row.local_username = Some(comm);
-                        }
+                        row.local_comm = Some(comm);
                         break;
                     }
                 }
             }
+            attr::enrich_flow_rows(&mut flows_rx);
+            attr::enrich_flow_rows(&mut flows_tx);
         }
 
         let have_any_missing_pid = flows_rx
@@ -809,7 +811,7 @@ async fn main() -> anyhow::Result<()> {
             .take(lines.min(snapshot.flows_rx.len()))
         {
             println!(
-                "  {}:{} -> {}:{} {} {} bytes pid={:?} uid={:?} user={:?}",
+                "  {}:{} -> {}:{} {} {} bytes pid={:?} comm={:?} uid={:?} user={:?}",
                 row.src_ip,
                 row.src_port,
                 row.dst_ip,
@@ -817,6 +819,7 @@ async fn main() -> anyhow::Result<()> {
                 row.protocol,
                 row.bytes,
                 row.local_pid,
+                row.local_comm,
                 row.local_uid,
                 row.local_username
             );
@@ -828,7 +831,7 @@ async fn main() -> anyhow::Result<()> {
             .take(lines.min(snapshot.flows_tx.len()))
         {
             println!(
-                "  {}:{} -> {}:{} {} {} bytes pid={:?} uid={:?} user={:?}",
+                "  {}:{} -> {}:{} {} {} bytes pid={:?} comm={:?} uid={:?} user={:?}",
                 row.src_ip,
                 row.src_port,
                 row.dst_ip,
@@ -836,6 +839,7 @@ async fn main() -> anyhow::Result<()> {
                 row.protocol,
                 row.bytes,
                 row.local_pid,
+                row.local_comm,
                 row.local_uid,
                 row.local_username
             );
@@ -876,6 +880,7 @@ mod flow_merge_tests {
             local_pid: None,
             local_uid: None,
             local_username: None,
+            local_comm: None,
         }
     }
 

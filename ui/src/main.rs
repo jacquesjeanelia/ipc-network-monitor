@@ -65,23 +65,44 @@ fn fmt_ts_ms(ts_ms: u64) -> String {
     format!("{h:02}:{m:02}:{s:02} UTC")
 }
 
-fn fmt_pid_user(pid: Option<u32>, uid: Option<u32>, username: Option<&str>) -> String {
-    match (pid, uid, username) {
-        (Some(p), Some(u), Some(n)) => format!("{n}  pid={p} uid={u}"),
-        (Some(p), Some(u), None)    => format!("pid={p} uid={u}"),
-        (Some(p), None, Some(n))    => format!("{n}  pid={p}"),
-        (Some(p), None, None)       => format!("pid={p}"),
-        _                           => "—".to_string(),
+fn flow_row_has_attribution(row: &FlowRow) -> bool {
+    row.local_pid.is_some()
+        || row.local_uid.is_some()
+        || row.local_username.as_deref().is_some_and(|s| !s.is_empty())
+        || row.local_comm.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+/// Task name (`local_comm`), login (`local_username`), pid, uid — omit missing pieces.
+fn fmt_flow_attribution(row: &FlowRow) -> String {
+    if !flow_row_has_attribution(row) {
+        return "—".to_string();
     }
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(c) = row.local_comm.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(c);
+    }
+    if let Some(u) = row.local_username.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(u);
+    }
+    let mut s = parts.join(" · ");
+    if let Some(p) = row.local_pid {
+        if !s.is_empty() {
+            s.push_str(" · ");
+        }
+        s.push_str(&format!("pid={p}"));
+    }
+    if let Some(u) = row.local_uid {
+        if !s.is_empty() {
+            s.push_str(" · ");
+        }
+        s.push_str(&format!("uid={u}"));
+    }
+    s
 }
 
 fn flow_attribution_rich_text(row: &FlowRow) -> RichText {
-    if row.local_pid.is_some() || row.local_uid.is_some() || row.local_username.is_some() {
-        return RichText::new(fmt_pid_user(
-            row.local_pid,
-            row.local_uid,
-            row.local_username.as_deref(),
-        ))
+    if flow_row_has_attribution(row) {
+        return RichText::new(fmt_flow_attribution(row))
         .small()
         .color(CLR_MUTED);
     }
@@ -96,7 +117,7 @@ fn flow_attribution_rich_text(row: &FlowRow) -> RichText {
 }
 
 fn flow_attribution_hover(row: &FlowRow) -> Option<&'static str> {
-    if row.local_pid.is_some() {
+    if flow_row_has_attribution(row) {
         return None;
     }
     Some(match row.protocol.as_str() {
@@ -941,6 +962,7 @@ impl App {
                             || r.dst_port.to_string().contains(filter_lc)
                             || r.protocol.to_lowercase().contains(filter_lc)
                             || r.local_username.as_deref().unwrap_or("").to_lowercase().contains(filter_lc)
+                            || r.local_comm.as_deref().unwrap_or("").to_lowercase().contains(filter_lc)
                             || r.local_pid
                                 .map(|p| filter_lc.contains(&p.to_string()))
                                 .unwrap_or(false)
@@ -1677,7 +1699,7 @@ fn flow_table_filtered(ui: &mut Ui, rows: &[&FlowRow], id: &str) {
                     }
                     let pr = ui.label(RichText::new("Process / User").small().strong().color(CLR_MUTED));
                     pr.on_hover_text(
-                        "Hover unattributed cells for hints. ICMP uses L3 · no socket. TCP/UDP “—” may need --ss-netns.",
+                        "Shows task name (/proc/…/comm), login, pid, uid when kernel-spy resolves them. Hover unattributed cells for hints.",
                     );
                     ui.end_row();
                     for row in rows.iter().take(FLOW_TABLE_MAX_ROWS) {

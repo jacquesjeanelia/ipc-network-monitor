@@ -32,8 +32,12 @@ pub struct FlowRow {
     /// owning user when `local_pid` is known; `None` if we could not resolve it
     #[serde(default)]
     pub local_uid: Option<u32>,
+    /// login name from passwd for `local_uid` (not the task `comm`)
     #[serde(default)]
     pub local_username: Option<String>,
+    /// task name from `/proc/<pid>/comm` when `local_pid` is known
+    #[serde(default)]
+    pub local_comm: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
