@@ -50,8 +50,10 @@ See [docs/CAPABILITY_REQUIREMENTS.md](../docs/CAPABILITY_REQUIREMENTS.md) for de
 ### General
 
 ```
--i, --interface <IFACE>
-    Monitor interface (e.g., eth0). Required.
+-i, --iface <IFACE>[,IFACE…]
+    Optional. One or more netdev names for XDP ingress + TC egress (commas or repeated `-i`, e.g. `-i eth0,wlan0`).
+    If you omit `-i` and do not set `iface` / `ifaces` in the config file, **every interface listed under `/sys/class/net`**
+    is attached (same eBPF maps; RX/TX aggregated). Narrow with `-i` when you want a subset. TOML: `iface = "eth0,wlan0"` or `ifaces = ["eth0", "wlan0"]`.
 
 -c, --config <PATH>
     Optional TOML config file for persistent settings.

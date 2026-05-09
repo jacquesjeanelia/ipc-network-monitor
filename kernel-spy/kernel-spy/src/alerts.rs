@@ -164,56 +164,58 @@ impl AlertEngine {
             });
         }
 
-        if self.cfg.conntrack_util_crit_percent > 0
-            && conntrack.utilization_percent >= self.cfg.conntrack_util_crit_percent as f64
-        {
-            out.push(AlertEvent {
-                ts_unix_ms: ts_ms,
-                kind: "conntrack_utilization".into(),
-                message: format!(
-                    "conntrack utilization {:.1}% >= critical {}%",
-                    conntrack.utilization_percent, self.cfg.conntrack_util_crit_percent
-                ),
-                severity: "critical".into(),
-            });
-        } else if self.cfg.conntrack_util_warn_percent > 0
-            && conntrack.utilization_percent >= self.cfg.conntrack_util_warn_percent as f64
-        {
-            out.push(AlertEvent {
-                ts_unix_ms: ts_ms,
-                kind: "conntrack_utilization".into(),
-                message: format!(
-                    "conntrack utilization {:.1}% >= warn {}%",
-                    conntrack.utilization_percent, self.cfg.conntrack_util_warn_percent
-                ),
-                severity: "warn".into(),
-            });
-        }
+        if !conntrack.sysctl_unavailable {
+            if self.cfg.conntrack_util_crit_percent > 0
+                && conntrack.utilization_percent >= self.cfg.conntrack_util_crit_percent as f64
+            {
+                out.push(AlertEvent {
+                    ts_unix_ms: ts_ms,
+                    kind: "conntrack_utilization".into(),
+                    message: format!(
+                        "conntrack utilization {:.1}% >= critical {}%",
+                        conntrack.utilization_percent, self.cfg.conntrack_util_crit_percent
+                    ),
+                    severity: "critical".into(),
+                });
+            } else if self.cfg.conntrack_util_warn_percent > 0
+                && conntrack.utilization_percent >= self.cfg.conntrack_util_warn_percent as f64
+            {
+                out.push(AlertEvent {
+                    ts_unix_ms: ts_ms,
+                    kind: "conntrack_utilization".into(),
+                    message: format!(
+                        "conntrack utilization {:.1}% >= warn {}%",
+                        conntrack.utilization_percent, self.cfg.conntrack_util_warn_percent
+                    ),
+                    severity: "warn".into(),
+                });
+            }
 
-        if self.cfg.conntrack_insert_failed_crit_per_tick > 0
-            && conntrack_delta.insert_failed >= self.cfg.conntrack_insert_failed_crit_per_tick
-        {
-            out.push(AlertEvent {
-                ts_unix_ms: ts_ms,
-                kind: "conntrack_insert_failed".into(),
-                message: format!(
-                    "conntrack insert_failed/tick {} >= critical {}",
-                    conntrack_delta.insert_failed, self.cfg.conntrack_insert_failed_crit_per_tick
-                ),
-                severity: "critical".into(),
-            });
-        } else if self.cfg.conntrack_insert_failed_warn_per_tick > 0
-            && conntrack_delta.insert_failed >= self.cfg.conntrack_insert_failed_warn_per_tick
-        {
-            out.push(AlertEvent {
-                ts_unix_ms: ts_ms,
-                kind: "conntrack_insert_failed".into(),
-                message: format!(
-                    "conntrack insert_failed/tick {} >= warn {}",
-                    conntrack_delta.insert_failed, self.cfg.conntrack_insert_failed_warn_per_tick
-                ),
-                severity: "warn".into(),
-            });
+            if self.cfg.conntrack_insert_failed_crit_per_tick > 0
+                && conntrack_delta.insert_failed >= self.cfg.conntrack_insert_failed_crit_per_tick
+            {
+                out.push(AlertEvent {
+                    ts_unix_ms: ts_ms,
+                    kind: "conntrack_insert_failed".into(),
+                    message: format!(
+                        "conntrack insert_failed/tick {} >= critical {}",
+                        conntrack_delta.insert_failed, self.cfg.conntrack_insert_failed_crit_per_tick
+                    ),
+                    severity: "critical".into(),
+                });
+            } else if self.cfg.conntrack_insert_failed_warn_per_tick > 0
+                && conntrack_delta.insert_failed >= self.cfg.conntrack_insert_failed_warn_per_tick
+            {
+                out.push(AlertEvent {
+                    ts_unix_ms: ts_ms,
+                    kind: "conntrack_insert_failed".into(),
+                    message: format!(
+                        "conntrack insert_failed/tick {} >= warn {}",
+                        conntrack_delta.insert_failed, self.cfg.conntrack_insert_failed_warn_per_tick
+                    ),
+                    severity: "warn".into(),
+                });
+            }
         }
 
         let nic_rx_dropped_delta: u64 = nic_stats_delta.iter().map(|r| r.rx_dropped).sum();

@@ -1,7 +1,10 @@
 import { useMemo, useState } from "react";
 import {
+  Bar,
+  BarChart,
   Brush,
   CartesianGrid,
+  Cell,
   Legend,
   Line,
   LineChart,
@@ -12,11 +15,18 @@ import {
 } from "recharts";
 import { isTauriShell, rpcCall, rpcInvoke } from "./bridge";
 import { AnalyticsView } from "./AnalyticsView";
-import { LINE_ACTIVE_DOT, throughputTooltipContent, TOOLTIP_CURSOR_LINE } from "./chartTooltips";
-import { classifyFlowBytes } from "./classify";
+import {
+  BAR_CHART_STATIC,
+  LINE_ACTIVE_DOT,
+  LINE_CHART_STATIC,
+  throughputTooltipContent,
+  TOOLTIP_CURSOR_LINE,
+} from "./chartTooltips";
+import { protocolRxTxFromSnapshot } from "./classify";
 import { fmtBytes } from "./fmt";
 import { useNetmonSession } from "./useNetmonSession";
-import type { FlowRow } from "./types";
+import { monitoredIfaceNames, type FlowRow } from "./types";
+import { mergeUserAggregates } from "./userAggregate";
 
 async function callRpc(method: string, params: Record<string, unknown> = {}) {
   return rpcCall(method, params);
@@ -149,23 +159,17 @@ export default function App() {
     return Array.from(s).sort((a, b) => a - b).slice(0, 64);
   }, [snap]);
 
-  const classified = useMemo(() => {
-    if (!snap) return null;
-    return classifyFlowBytes([...snap.flows_rx, ...snap.flows_tx]);
+  const protoRxTxChartData = useMemo(() => {
+    if (!snap) return [] as Array<{ proto: string; rx: number; tx: number; rxFill: string; txFill: string }>;
+    const rows = protocolRxTxFromSnapshot(snap);
+    const rxPalette = ["#4da3ff", "#7ec8ff", "#9b7aff", "#c49aed", "#5a6d82", "#e7a23d", "#3ecf8e", "#f06b6b", "#ff9f6e", "#6b8cae"];
+    const txPalette = ["#356a99", "#5599b8", "#6b4dc4", "#7a6096", "#3d4a5e", "#a67a28", "#2a8f4f", "#b54545", "#b86a3d", "#4d6a7a"];
+    return rows.map((r, i) => ({
+      ...r,
+      rxFill: rxPalette[i % rxPalette.length],
+      txFill: txPalette[i % txPalette.length],
+    }));
   }, [snap]);
-
-  const protoTotal = classified
-    ? classified.tcp_bytes +
-      classified.udp_bytes +
-      classified.icmp_bytes +
-      classified.icmpv6_bytes +
-      classified.igmp_bytes +
-      classified.gre_bytes +
-      classified.sctp_bytes +
-      classified.esp_bytes +
-      classified.ah_bytes +
-      classified.other_bytes
-    : 0;
 
   const mergedFlows = useMemo(() => {
     if (!snap) return [] as TaggedFlow[];
@@ -220,7 +224,7 @@ export default function App() {
 
   const sortedPidRows = useMemo(() => {
     if (!snap) return [];
-    const rows = [...snap.aggregates_by_pid];
+    const rows = [...(snap.aggregates_by_pid ?? [])];
     const dir = pidSort.dir === "asc" ? 1 : -1;
     rows.sort((a, b) => {
       switch (pidSort.key) {
@@ -239,7 +243,7 @@ export default function App() {
 
   const sortedUserRows = useMemo(() => {
     if (!snap) return [];
-    const rows = [...snap.aggregates_by_user];
+    const rows = mergeUserAggregates([...(snap.aggregates_by_user ?? [])]);
     const dir = userSort.dir === "asc" ? 1 : -1;
     rows.sort((a, b) => {
       switch (userSort.key) {
@@ -363,12 +367,7 @@ export default function App() {
           <>
             <h1 className="page-title">Dashboard</h1>
             <p className="page-sub">
-              <strong>{snap.iface}</strong> · live utilization, flows, and top talkers · tick{" "}
-              {new Date(snap.ts_unix_ms).toLocaleTimeString()}
-              {" · "}
-              <span style={{ color: "var(--muted)" }}>
-                Policy match preview: <strong>Control</strong> → Policy simulate. Live drops: Health → policy drops / nft readiness below.
-              </span>
+              <strong>{snap.iface}</strong> · tick {new Date(snap.ts_unix_ms).toLocaleTimeString()}
             </p>
 
             <div className="strip">
@@ -442,21 +441,17 @@ export default function App() {
                       <Tooltip content={throughputTip} cursor={TOOLTIP_CURSOR_LINE} />
                       <Legend />
                       <Line
-                        type="monotone"
+                        {...LINE_CHART_STATIC}
                         dataKey="rx"
                         name="RX"
                         stroke="#4da3ff"
-                        dot={false}
-                        strokeWidth={2}
                         activeDot={LINE_ACTIVE_DOT}
                       />
                       <Line
-                        type="monotone"
+                        {...LINE_CHART_STATIC}
                         dataKey="tx"
                         name="TX"
                         stroke="#3ecf8e"
-                        dot={false}
-                        strokeWidth={2}
                         activeDot={LINE_ACTIVE_DOT}
                       />
                       <Brush dataKey="t" height={18} stroke="#4a6078" fill="rgba(18,24,32,0.65)" travellerWidth={9} />
@@ -468,68 +463,48 @@ export default function App() {
               </div>
             </div>
 
-            {classified && protoTotal > 0 && (
+            {protoRxTxChartData.length > 0 && (
               <div className="chart-card">
-                <div className="chart-title">Protocol mix (this tick, attributed flows)</div>
-                <div
-                  style={{
-                    display: "flex",
-                    height: 12,
-                    borderRadius: 6,
-                    overflow: "hidden",
-                    marginTop: 8,
-                  }}
-                >
-                  {(
-                    [
-                      ["TCP", classified.tcp_bytes, "#4da3ff"],
-                      ["UDP", classified.udp_bytes, "#7ec8ff"],
-                      ["ICMP", classified.icmp_bytes, "#5a6d82"],
-                      ["ICMPv6", classified.icmpv6_bytes, "#9b7aff"],
-                      ["IGMP", classified.igmp_bytes, "#c49aed"],
-                      ["GRE", classified.gre_bytes, "#e7a23d"],
-                      ["SCTP", classified.sctp_bytes, "#3ecf8e"],
-                      ["ESP", classified.esp_bytes, "#f06b6b"],
-                      ["AH", classified.ah_bytes, "#ff9f6e"],
-                      ["Other", classified.other_bytes, "#4a5568"],
-                    ] as const
-                  ).map(([label, bytes, color]) => (
-                    <div
-                      key={label}
-                      title={`${label}: ${fmtBytes(bytes)}`}
-                      style={{
-                        width: `${(Number(bytes) / protoTotal) * 100}%`,
-                        background: String(color),
-                        minWidth: Number(bytes) > 0 ? 2 : 0,
-                      }}
-                    />
-                  ))}
+                <div className="chart-title">Protocol bytes (RX vs TX)</div>
+                <p className="page-sub" style={{ margin: "6px 0 0", fontSize: "0.78rem", color: "var(--muted)" }}>
+                  eBPF map totals; RX/TX split from sampled flow rows per protocol.
+                </p>
+                <div style={{ height: Math.min(400, 48 + protoRxTxChartData.length * 40), marginTop: 10 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart
+                      layout="vertical"
+                      data={protoRxTxChartData}
+                      margin={{ left: 4, right: 12, top: 4, bottom: 4 }}
+                    >
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a3848" horizontal />
+                      <XAxis
+                        type="number"
+                        stroke="#6b7a90"
+                        fontSize={11}
+                        tickFormatter={(v) => fmtBytes(v)}
+                      />
+                      <YAxis type="category" dataKey="proto" stroke="#6b7a90" fontSize={11} width={56} tickLine={false} />
+                      <Tooltip formatter={(v) => fmtBytes(Number(v))} />
+                      <Legend />
+                      <Bar {...BAR_CHART_STATIC} dataKey="rx" name="RX" maxBarSize={22}>
+                        {protoRxTxChartData.map((e) => (
+                          <Cell key={`rx-${e.proto}`} fill={e.rxFill} />
+                        ))}
+                      </Bar>
+                      <Bar {...BAR_CHART_STATIC} dataKey="tx" name="TX" maxBarSize={22}>
+                        {protoRxTxChartData.map((e) => (
+                          <Cell key={`tx-${e.proto}`} fill={e.txFill} />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
                 </div>
-                {(
-                  [
-                    ["TCP", classified.tcp_bytes],
-                    ["UDP", classified.udp_bytes],
-                    ["ICMP", classified.icmp_bytes],
-                    ["ICMPv6", classified.icmpv6_bytes],
-                    ["IGMP", classified.igmp_bytes],
-                    ["GRE", classified.gre_bytes],
-                    ["SCTP", classified.sctp_bytes],
-                    ["ESP", classified.esp_bytes],
-                    ["AH", classified.ah_bytes],
-                    ["Other", classified.other_bytes],
-                  ] as const
-                ).map(([label, bytes]) => (
-                  <div className="proto-row" key={label}>
-                    <span>{label}</span>
-                    <span className="v">{fmtBytes(bytes)}</span>
-                  </div>
-                ))}
               </div>
             )}
 
             <div className="section">
               <h3>Top talkers (process)</h3>
-              {snap.aggregates_by_pid.length === 0 ? (
+              {(snap.aggregates_by_pid ?? []).length === 0 ? (
                 <p className="empty">No PID aggregates yet.</p>
               ) : (
                 <table className="flows">
@@ -543,7 +518,7 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {snap.aggregates_by_pid.slice(0, 10).map((r) => (
+                    {(snap.aggregates_by_pid ?? []).slice(0, 10).map((r) => (
                       <tr key={r.pid}>
                         <td>{r.pid}</td>
                         <td>{r.comm ?? "—"}</td>
@@ -847,24 +822,15 @@ export default function App() {
         {snap && tab === "correlation" && (
           <>
             <h1 className="page-title">Correlation</h1>
-            <p className="page-sub">
-              Traffic by process and by owning user. Rows with unknown attribution stay visible on the dashboard flow
-              table. Use <strong>Dashboard flows</strong> to filter to one PID.
-            </p>
+            <p className="page-sub">Processes and users from the latest snapshot. Use Dashboard flows to filter by PID.</p>
             <div className="section" style={{ borderLeft: "3px solid var(--orange)", paddingLeft: 12 }}>
-              <h3>Short-lived connections (FR-C6)</h3>
+              <h3>Short-lived connections</h3>
               <p className="page-sub" style={{ marginBottom: 0 }}>
-                Correlation joins eBPF flow keys to socket tables and proc metadata on a polling interval. Very short
-                flows may appear late, as unknown, or only in aggregate counters because the owning socket or process
-                can disappear between samples. Event-driven eBPF reduces gaps but cannot guarantee perfect attribution for
-                every micro-connection.
+                Very short flows can miss socket/proc joins between samples; aggregates still reflect bytes.
               </p>
             </div>
             <div className="section">
               <h3>By process</h3>
-              <p className="page-sub" style={{ marginBottom: 8 }}>
-                Interface column reflects the monitored iface for this session. Sort headers (FR-U3).
-              </p>
               <table className="flows">
                 <thead>
                   <tr>
@@ -990,13 +956,20 @@ export default function App() {
 
             <div className="section">
               <h3>Attribution gaps</h3>
+              <p className="page-sub" style={{ marginBottom: 8 }}>
+                Rows without PID (or TCP/UDP without UID) in the <strong>same top-N flow sample</strong> as the flows
+                table — not the full eBPF map. Use the hints for <code>--ss-enrich</code>, <code>--ss-netns</code>, or
+                L3-only expectations.
+              </p>
               <div className="table-wrap">
                 {snap.unknown_attribution_buckets && snap.unknown_attribution_buckets.length > 0 ? (
                   <table className="flows">
                     <thead>
                       <tr>
-                        <th>Signal</th>
-                        <th>Flows</th>
+                        <th>Reason code</th>
+                        <th>Rows</th>
+                        <th>Bytes (sample)</th>
+                        <th>What it usually means</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1004,12 +977,17 @@ export default function App() {
                         <tr key={u.kind}>
                           <td style={{ fontFamily: "var(--mono)", fontSize: "0.78rem" }}>{u.kind}</td>
                           <td>{u.count.toLocaleString()}</td>
+                          <td>{fmtBytes(u.bytes ?? 0)}</td>
+                          <td style={{ fontSize: "0.78rem", lineHeight: 1.45, maxWidth: 520 }}>{u.hint ?? ""}</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 ) : (
-                  <p className="empty">No unknown-attribution buckets this tick.</p>
+                  <p className="empty">
+                    No gaps in the sampled flow rows this tick (or every top flow had PID+UID). Raise{" "}
+                    <code>--max-flow-rows</code> if you need a wider sample.
+                  </p>
                 )}
               </div>
             </div>
@@ -1577,8 +1555,9 @@ export default function App() {
             <div className="section" style={{ borderLeft: "3px solid var(--orange)", paddingLeft: 12 }}>
               <h3>Lab: traffic shaping (FR-S1 / FR-S2)</h3>
               <p className="page-sub">
-                Applies <code>tc netem delay</code> on the <strong>root qdisc</strong> of <strong>{snap.iface}</strong>{" "}
-                (replaces root). Intended for demos only — large delays can make SSH unusable. For delays over 2000 ms
+                Applies <code>tc netem delay</code> on the <strong>root qdisc</strong> of{" "}
+                <strong>{monitoredIfaceNames(snap).join(", ")}</strong> (replaces root on each). Intended for demos only
+                — large delays can make SSH unusable. For delays over 2000 ms
                 you must tick confirm unless the collector was started with <code>--netem-confirm</code>.
               </p>
               <label className="page-sub" style={{ display: "block", marginTop: 8 }}>

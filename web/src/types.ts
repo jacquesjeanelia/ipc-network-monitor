@@ -55,6 +55,7 @@ export interface MonitorSnapshotV1 {
   schema_version: number;
   ts_unix_ms: number;
   iface: string;
+  monitored_ifaces?: string[];
   rx: { packets: number; bytes: number };
   tx: { packets: number; bytes: number };
   health: {
@@ -65,6 +66,8 @@ export interface MonitorSnapshotV1 {
   };
   flows_rx: FlowRow[];
   flows_tx: FlowRow[];
+  /** All eBPF flow-map bytes by IP protocol (use for mix charts; `flows_*` are top-N only). */
+  flow_protocol_totals?: FlowProtocolTotals;
   probe_status?: {
     xdp_attached?: boolean;
     tc_egress_attached?: boolean;
@@ -80,7 +83,7 @@ export interface MonitorSnapshotV1 {
   aggregate_history_by_pid?: ProcessTrafficRow[];
   aggregate_history_by_user?: UserTrafficRow[];
   alerts: AlertEvent[];
-  unknown_attribution_buckets?: { kind: string; count: number }[];
+  unknown_attribution_buckets?: { kind: string; count: number; bytes?: number; hint?: string }[];
   cgroup_pressure?: { cgroup: string; bytes_total: number; flow_count?: number }[];
   /** Per-tick drop reason deltas when collector supplies them */
   drop_reasons?: { reason: string; count_delta: number; percent: number }[];
@@ -90,7 +93,13 @@ export interface MonitorSnapshotV1 {
     blocked_flows: number;
     top_pids?: number[];
   }[];
-  conntrack?: { count: number; max: number; utilization_percent: number };
+  conntrack?: {
+    count: number;
+    max: number;
+    utilization_percent: number;
+    /** True when nf_conntrack sysctl files are absent (module not loaded). */
+    sysctl_unavailable?: boolean;
+  };
   conntrack_delta?: {
     found?: number;
     invalid?: number;
@@ -155,9 +164,34 @@ export interface MonitorSnapshotV1 {
   };
 }
 
+/** Ordered list of netdevs the collector attached on; falls back to splitting `iface` on `+` when absent. */
+export function monitoredIfaceNames(s: MonitorSnapshotV1): string[] {
+  if (s.monitored_ifaces?.length) return s.monitored_ifaces;
+  if (s.iface.includes("+")) return s.iface.split("+");
+  return [s.iface];
+}
+
+export function primaryMonitoredIface(s: MonitorSnapshotV1): string {
+  return monitoredIfaceNames(s)[0] ?? s.iface;
+}
+
 export type PushEvent =
   | { evt: "snapshot"; snap: MonitorSnapshotV1 }
   | { evt: "link"; connected: boolean };
+
+/** Full eBPF per-flow map byte sums (same buckets as `ProtoClass`). */
+export interface FlowProtocolTotals {
+  tcp_bytes?: number;
+  udp_bytes?: number;
+  icmp_bytes?: number;
+  icmpv6_bytes?: number;
+  igmp_bytes?: number;
+  gre_bytes?: number;
+  sctp_bytes?: number;
+  esp_bytes?: number;
+  ah_bytes?: number;
+  other_bytes?: number;
+}
 
 export interface ProtoClass {
   tcp_bytes: number;

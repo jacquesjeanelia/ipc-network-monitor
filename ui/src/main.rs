@@ -23,6 +23,22 @@ const MAX_ALERT_LOG: usize = 500;
 /// Show all flows present in the snapshot (server caps with `--max-flow-rows`).
 const FLOW_TABLE_MAX_ROWS: usize = 512;
 
+fn pretty_monitored_ifaces(s: &MonitorSnapshotV1) -> String {
+    if !s.monitored_ifaces.is_empty() {
+        s.monitored_ifaces.join(", ")
+    } else {
+        s.iface.clone()
+    }
+}
+
+fn kernel_spy_iface_cli_arg(s: &MonitorSnapshotV1) -> String {
+    if !s.monitored_ifaces.is_empty() {
+        s.monitored_ifaces.join(",")
+    } else {
+        s.iface.replace('+', ",")
+    }
+}
+
 // ── palette (VS Code–style dark: near-white text, blue accents, gray chrome) ─
 
 const CLR_BG: Color32         = Color32::from_rgb(0x1e, 0x1e, 0x1e);
@@ -648,7 +664,7 @@ impl eframe::App for App {
                             let short = &sid[..8.min(sid.len())];
                             ui.colored_label(CLR_MUTED, format!("session: {short}"));
                             ui.separator();
-                            ui.colored_label(CLR_MUTED, format!("iface: {}", s.iface));
+                            ui.colored_label(CLR_MUTED, format!("iface: {}", pretty_monitored_ifaces(s)));
                         } else if snap.is_none() {
                             ui.colored_label(CLR_RED,
                                 RichText::new("Waiting for kernel-spy export socket…").size(12.0));
@@ -708,7 +724,7 @@ fn glance_strip(ui: &mut Ui, snap: &MonitorSnapshotV1) {
         .inner_margin(Margin::same(14.0))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                glance_item(ui, "IFACE", &snap.iface, CLR_BLUE_LIGHT);
+                glance_item(ui, "IFACE", &pretty_monitored_ifaces(snap), CLR_BLUE_LIGHT);
                 glance_item(
                     ui,
                     "coverage",
@@ -1317,12 +1333,16 @@ impl App {
                                     .striped(true)
                                     .spacing([18.0, 8.0])
                                     .show(ui, |ui| {
-                                        ui.label(RichText::new("Signal").weak());
-                                        ui.label(RichText::new("Flows").weak());
+                                        ui.label(RichText::new("Reason").weak());
+                                        ui.label(RichText::new("Rows").weak());
+                                        ui.label(RichText::new("Bytes").weak());
+                                        ui.label(RichText::new("Hint").weak());
                                         ui.end_row();
                                         for bucket in &snap.unknown_attribution_buckets {
                                             ui.monospace(&bucket.kind);
                                             ui.label(bucket.count.to_string());
+                                            ui.label(fmt_bytes(bucket.bytes));
+                                            ui.label(RichText::new(bucket.hint.as_str()).small().weak());
                                             ui.end_row();
                                         }
                                     });
@@ -1761,12 +1781,12 @@ impl App {
             ui.add_space(8.0);
             ui.colored_label(
                 CLR_MUTED,
-                "The monitored interface is chosen when kernel-spy starts (CLI -i/--iface or config file). \
-                 Changing it requires restarting kernel-spy on the desired interface.",
+                "The monitored interface(s) are chosen when kernel-spy starts: with no `-i` and no config list, every name under `/sys/class/net` is used; otherwise CLI `-i` (comma-separated or repeated) or config `iface` / `ifaces`. \
+                 Changing them requires restarting kernel-spy.",
             );
             ui.add_space(12.0);
             if let Some(s) = snap {
-                kv_pair(ui, "Active iface", &s.iface);
+                kv_pair(ui, "Active iface(s)", &pretty_monitored_ifaces(s));
                 ui.add_space(10.0);
                 section_header(ui, "Process & user attribution (TCP/UDP via /proc)");
                 ui.add_space(4.0);
@@ -1778,7 +1798,7 @@ impl App {
                 ui.add_space(10.0);
                 let suggested = format!(
                     "kernel-spy -i {} --export-socket /tmp/ipc-netmon.sock --control-socket /tmp/ipc-netmon-ctl.sock",
-                    s.iface
+                    kernel_spy_iface_cli_arg(s)
                 );
                 let suggested_netns = format!("{suggested} --ss-netns <your-netns>");
                 ui.horizontal(|ui| {

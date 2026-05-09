@@ -23,13 +23,15 @@ The `kernel-spy` binary embeds the eBPF object built from `kernel-spy-ebpf` (see
 Requires appropriate capabilities (`CAP_NET_ADMIN`, `CAP_BPF`, etc.) for loading programs and managing tc/nft.
 
 ```sh
-sudo ./target/release/kernel-spy -i eth0 --no-export-socket
+sudo ./target/release/kernel-spy --no-export-socket
+# default: attach to all names in /sys/class/net; narrow with: -i eth0,wlan0
 ```
 
 Export **newline-delimited JSON** (default socket `/tmp/ipc-netmon.sock`). Each line is preferably a wrapped envelope `{"kind":"monitor_snapshot","payload":{...}}` (`ExportLine` in `common`); bare `MonitorSnapshotV1` JSON is still emitted for debugging in some builds - clients should use `common::parse_export_line`, which accepts both.
 
 ```sh
-sudo ./target/release/kernel-spy -i eth0
+sudo ./target/release/kernel-spy
+# or restrict: sudo ./target/release/kernel-spy -i eth0,wlan0
 ```
 
 Control RPC (default `/tmp/ipc-netmon-ctl.sock`), JSON **one request per line** — e.g. `{"method":"ping"}`, `{"method":"session_dump"}`, `{"method":"session_dump_file","params":{"path":"/tmp/session.json"}}`, `{"method":"nft_preview_drop","params":{"dst":"203.0.113.1"}}`, `{"method":"nft_preview_accept_ipv4","params":{"dst":"203.0.113.1"}}`, `{"method":"nft_preview_rate_limit","params":{"dst":"203.0.113.1","rate":"10 mbytes/second"}}`, `{"method":"nft_preview_drop_uid","params":{"uid":1000}}`, `{"method":"nft_apply_drop_uid","params":{"uid":1000}}` (and analogous **`_gid`** methods). Full method dispatch is in `kernel-spy/src/control_rpc.rs`.

@@ -91,8 +91,16 @@ impl FlowRow {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AttributionBucket {
+    /// Stable reason code (matches `FlowRow.attribution_reasons` primary tags where possible).
     pub kind: String,
+    /// Number of sampled flow rows in this bucket (same cap as `flows_rx`/`flows_tx`).
     pub count: u64,
+    /// Sum of `bytes` for those rows (use for prioritization vs global totals).
+    #[serde(default)]
+    pub bytes: u64,
+    /// Short guidance for operators (English).
+    #[serde(default)]
+    pub hint: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -218,6 +226,31 @@ pub struct EbpfFlowMapStats {
     pub v6_max_entries: u32,
 }
 
+/// Byte sums over **all** IPv4/IPv6 eBPF per-flow map entries (not the top-N `flows_rx`/`flows_tx` sample).
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct FlowProtocolTotals {
+    #[serde(default)]
+    pub tcp_bytes: u64,
+    #[serde(default)]
+    pub udp_bytes: u64,
+    #[serde(default)]
+    pub icmp_bytes: u64,
+    #[serde(default)]
+    pub icmpv6_bytes: u64,
+    #[serde(default)]
+    pub igmp_bytes: u64,
+    #[serde(default)]
+    pub gre_bytes: u64,
+    #[serde(default)]
+    pub sctp_bytes: u64,
+    #[serde(default)]
+    pub esp_bytes: u64,
+    #[serde(default)]
+    pub ah_bytes: u64,
+    #[serde(default)]
+    pub other_bytes: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct IpFragSignalsDelta {
     pub reasm_reqds: u64,
@@ -234,6 +267,9 @@ pub struct ConntrackSignals {
     pub count: u64,
     pub max: u64,
     pub utilization_percent: f64,
+    /// True when `/proc/sys/net/netfilter/nf_conntrack_max` is missing (nf_conntrack not loaded / no sysctl API).
+    #[serde(default)]
+    pub sysctl_unavailable: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -376,11 +412,16 @@ pub struct MonitorSnapshotV1 {
     pub schema_version: u32,
     pub ts_unix_ms: u64,
     pub iface: String,
+    /// netdevs this collector attached XDP/TC on (same eBPF maps — RX/TX totals are aggregated).
+    #[serde(default)]
+    pub monitored_ifaces: Vec<String>,
     pub rx: DirectionTotals,
     pub tx: DirectionTotals,
     pub health: HealthSnapshot,
     pub flows_rx: Vec<FlowRow>,
     pub flows_tx: Vec<FlowRow>,
+    #[serde(default)]
+    pub flow_protocol_totals: FlowProtocolTotals,
     #[serde(default)]
     pub probe_status: ProbeStatus,
     #[serde(default)]

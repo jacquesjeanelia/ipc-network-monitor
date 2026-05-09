@@ -12,18 +12,59 @@ fn comm_for_pid(pid: u32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// First argv fragment from `/proc/<pid>/cmdline` (basename), when `comm` is empty or unhelpful.
+fn argv0_hint_for_pid(pid: u32) -> Option<String> {
+    let p = format!("/proc/{pid}/cmdline");
+    let raw = std::fs::read(&p).ok()?;
+    let arg0 = raw.split(|&b| b == 0).next()?;
+    if arg0.is_empty() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(arg0);
+    let base = s.rsplit('/').next()?.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let t: String = base.chars().take(48).collect();
+    Some(t)
+}
+
+#[derive(Default)]
+struct PidAgg {
+    bytes_total: u64,
+    /// `local_comm` from the flow row with the largest `bytes` among rows that had a non-empty comm.
+    comm_from_flows: Option<String>,
+    comm_flow_row_bytes: u64,
+}
+
+fn note_flow_comm(agg: &mut PidAgg, row_bytes: u64, comm: Option<&String>) {
+    let Some(c) = comm else {
+        return;
+    };
+    let t = c.trim();
+    if t.is_empty() {
+        return;
+    }
+    if agg.comm_from_flows.is_none() || row_bytes > agg.comm_flow_row_bytes {
+        agg.comm_from_flows = Some(t.to_string());
+        agg.comm_flow_row_bytes = row_bytes;
+    }
+}
+
 pub fn aggregates_from_flows(
     rows_rx: &[FlowRow],
     rows_tx: &[FlowRow],
     ts_unix_ms: u64,
     total_bytes: u64,
 ) -> (Vec<ProcessTrafficRow>, Vec<UserTrafficRow>) {
-    let mut by_pid: HashMap<u32, u64> = HashMap::new();
+    let mut by_pid: HashMap<u32, PidAgg> = HashMap::new();
     let mut by_uid: HashMap<u32, u64> = HashMap::new();
 
     for row in rows_rx.iter().chain(rows_tx.iter()) {
         if let Some(pid) = row.local_pid {
-            *by_pid.entry(pid).or_insert(0) += row.bytes;
+            let e = by_pid.entry(pid).or_default();
+            e.bytes_total += row.bytes;
+            note_flow_comm(e, row.bytes, row.local_comm.as_ref());
         }
         if let Some(uid) = row.local_uid {
             *by_uid.entry(uid).or_insert(0) += row.bytes;
@@ -32,15 +73,19 @@ pub fn aggregates_from_flows(
 
     let mut proc_rows: Vec<ProcessTrafficRow> = by_pid
         .into_iter()
-        .map(|(pid, bytes_total)| {
+        .map(|(pid, agg)| {
+            let bytes_total = agg.bytes_total;
             let share_percent = if total_bytes > 0 {
                 (bytes_total as f64 / total_bytes as f64) * 100.0
             } else {
                 0.0
             };
+            let comm = comm_for_pid(pid)
+                .or(agg.comm_from_flows.clone())
+                .or_else(|| argv0_hint_for_pid(pid));
             ProcessTrafficRow {
                 pid,
-                comm: comm_for_pid(pid),
+                comm,
                 bytes_total,
                 ts_unix_ms,
                 share_percent,
@@ -129,5 +174,47 @@ impl AggregateHistory {
     pub fn clear(&mut self) {
         self.pid_history.clear();
         self.uid_history.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::FlowRow;
+
+    fn minimal_flow(bytes: u64, pid: u32, comm: Option<&str>) -> FlowRow {
+        FlowRow {
+            src_ip: String::new(),
+            dst_ip: String::new(),
+            src_port: 0,
+            dst_port: 0,
+            protocol: String::new(),
+            bytes,
+            local_pid: Some(pid),
+            local_uid: None,
+            local_gid: None,
+            local_username: None,
+            local_comm: comm.map(|s| s.to_string()),
+            attribution_confidence: String::new(),
+            attribution_reasons: Vec::new(),
+            attribution_path: String::new(),
+            netns: None,
+            cgroup: None,
+            container_hint: None,
+        }
+    }
+
+    #[test]
+    fn aggregate_comm_falls_back_to_flow_local_comm() {
+        let fake_pid = u32::MAX;
+        let rx = vec![minimal_flow(100, fake_pid, Some("mydaemon"))];
+        let (proc, _) = aggregates_from_flows(&rx, &[], 0, 100);
+        assert_eq!(proc.len(), 1);
+        assert_eq!(proc[0].pid, fake_pid);
+        assert_eq!(
+            proc[0].comm.as_deref(),
+            Some("mydaemon"),
+            "no /proc for this pid; use flow comm"
+        );
     }
 }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { classifyFlowBytes } from "./classify";
+import { protocolMixFromSnapshot } from "./classify";
 import type {
   AlertEvent,
   MonitorSnapshotV1,
@@ -8,6 +8,7 @@ import type {
   ProtoSnapshot,
   UserTrafficRow,
 } from "./types";
+import { mergeUserAggregates, sumFlowBytesByUid } from "./userAggregate";
 
 const HISTORY_CAP = 120;
 const PROTO_HISTORY_CAP = 60;
@@ -195,16 +196,19 @@ export function useNetmonSession(selectedPort: number | null): NetmonDerived {
       if (softnetHist.length >= HISTORY_CAP) softnetHist.shift();
       softnetHist.push([elapsed, sd, snap.ts_unix_ms]);
 
-      const merged = [...snap.flows_rx, ...snap.flows_tx];
-      const classified = classifyFlowBytes(merged);
+      const classified = protocolMixFromSnapshot(snap);
       if (protoHist.length >= PROTO_HISTORY_CAP) protoHist.shift();
       protoHist.push({ ...classified, elapsed });
 
-      for (const row of snap.aggregates_by_pid) recentProcs = rememberPid(recentProcs, row);
-      for (const row of snap.aggregates_by_user) recentUsers = rememberUser(recentUsers, row);
+      for (const row of snap.aggregates_by_pid ?? []) recentProcs = rememberPid(recentProcs, row);
+      for (const row of snap.aggregates_by_user ?? []) recentUsers = rememberUser(recentUsers, row);
 
-      const sumPidBytes = snap.aggregates_by_pid.reduce((a, r) => a + r.bytes_total, 0);
-      const sumUserBytes = snap.aggregates_by_user.reduce((a, r) => a + r.bytes_total, 0);
+      const sumPidBytes = (snap.aggregates_by_pid ?? []).reduce((a, r) => a + r.bytes_total, 0);
+      const mergedUserAgg = mergeUserAggregates(snap.aggregates_by_user ?? []);
+      const sumUserBytes =
+        mergedUserAgg.length > 0
+          ? mergedUserAgg.reduce((a, r) => a + r.bytes_total, 0)
+          : sumFlowBytesByUid([...(snap.flows_rx ?? []), ...(snap.flows_tx ?? [])]);
       if (sumPidBytesHist.length >= HISTORY_CAP) sumPidBytesHist.shift();
       sumPidBytesHist.push([elapsed, sumPidBytes, snap.ts_unix_ms]);
       if (sumUserBytesHist.length >= HISTORY_CAP) sumUserBytesHist.shift();

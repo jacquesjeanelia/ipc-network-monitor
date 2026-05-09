@@ -14,13 +14,17 @@ import {
 import { useMemo } from "react";
 import {
   analyticsSessionTooltipsFor,
+  BAR_CHART_STATIC,
   LINE_ACTIVE_DOT,
+  LINE_CHART_STATIC,
   procBarTooltipContent,
   TOOLTIP_CURSOR_LINE,
   userBarTooltipContent,
 } from "./chartTooltips";
 import { fmtBytes } from "./fmt";
-import type { MonitorSnapshotV1 } from "./types";
+import { protocolMixFromSnapshot } from "./classify";
+import { monitoredIfaceNames, type MonitorSnapshotV1 } from "./types";
+import { mergeUserAggregates } from "./userAggregate";
 import type { NetmonDerived, TsHistTuple } from "./useNetmonSession";
 
 function nonzeroRecordEntries(d: Record<string, number> | undefined, max: number): [string, number][] {
@@ -108,6 +112,28 @@ function domainByteSeries(rows: Array<Record<string, number>>): [number, number]
   return [0, mx * 1.08];
 }
 
+function rollupFlowProtocols(snap: MonitorSnapshotV1): { proto: string; bytes: number; flows: number }[] {
+  const mix = protocolMixFromSnapshot(snap);
+  const flowCounts = new Map<string, number>();
+  for (const f of [...snap.flows_rx, ...snap.flows_tx]) {
+    const p = (f.protocol || "UNKNOWN").trim() || "UNKNOWN";
+    flowCounts.set(p, (flowCounts.get(p) ?? 0) + 1);
+  }
+  const rows: { proto: string; bytes: number; flows: number }[] = [
+    { proto: "TCP", bytes: mix.tcp_bytes, flows: flowCounts.get("TCP") ?? 0 },
+    { proto: "UDP", bytes: mix.udp_bytes, flows: flowCounts.get("UDP") ?? 0 },
+    { proto: "ICMP", bytes: mix.icmp_bytes, flows: flowCounts.get("ICMP") ?? 0 },
+    { proto: "ICMPv6", bytes: mix.icmpv6_bytes, flows: flowCounts.get("ICMPv6") ?? 0 },
+    { proto: "IGMP", bytes: mix.igmp_bytes, flows: flowCounts.get("IGMP") ?? 0 },
+    { proto: "GRE", bytes: mix.gre_bytes, flows: flowCounts.get("GRE") ?? 0 },
+    { proto: "SCTP", bytes: mix.sctp_bytes, flows: flowCounts.get("SCTP") ?? 0 },
+    { proto: "ESP", bytes: mix.esp_bytes, flows: flowCounts.get("ESP") ?? 0 },
+    { proto: "AH", bytes: mix.ah_bytes, flows: flowCounts.get("AH") ?? 0 },
+    { proto: "Other", bytes: mix.other_bytes, flows: flowCounts.get("Other") ?? 0 },
+  ];
+  return rows.filter((r) => r.bytes > 0).sort((a, b) => b.bytes - a.bytes);
+}
+
 type Props = {
   snap: MonitorSnapshotV1;
   sess: NetmonDerived;
@@ -116,26 +142,36 @@ type Props = {
 export function AnalyticsView({ snap, sess }: Props) {
   const sessTt = useMemo(() => analyticsSessionTooltipsFor(snap.iface), [snap.iface]);
 
-  const procBars = [...snap.aggregates_by_pid]
+  const procBars = [...(snap.aggregates_by_pid ?? [])]
     .sort((a, b) => b.bytes_total - a.bytes_total)
     .slice(0, 14)
-    .map((r) => ({
-      label: `${r.pid} ${(r.comm ?? "—").replace(/\s+/g, " ").slice(0, 18)}`.trim(),
-      pid: r.pid,
-      comm: (r.comm ?? "—").replace(/\s+/g, " ").trim(),
-      bytes: r.bytes_total,
-      share: r.share_percent,
-    }));
-  const userBars = [...snap.aggregates_by_user]
-    .sort((a, b) => b.bytes_total - a.bytes_total)
+    .map((r) => {
+      const comm = (r.comm ?? "—").replace(/\s+/g, " ").trim();
+      return {
+        barKey: `pid-${r.pid}`,
+        label: `${r.pid} ${comm}`.slice(0, 56).trim(),
+        pid: r.pid,
+        comm,
+        bytes: r.bytes_total,
+        share: r.share_percent,
+      };
+    });
+  const mergedUsers = mergeUserAggregates([...(snap.aggregates_by_user ?? [])]);
+  const userBars = mergedUsers
+    .filter((r) => r.bytes_total > 0)
     .slice(0, 14)
-    .map((r) => ({
-      label: `${r.uid} ${(r.username ?? "—").replace(/\s+/g, " ").slice(0, 16)}`.trim(),
-      uid: r.uid,
-      username: (r.username ?? "—").replace(/\s+/g, " ").trim(),
-      bytes: r.bytes_total,
-      share: r.share_percent,
-    }));
+    .map((r) => {
+      const name = (r.username ?? "—").replace(/\s+/g, " ").trim();
+      return {
+        barKey: `uid-${r.uid}`,
+        label: `${r.uid} ${name}`.trim().slice(0, 56),
+        uid: r.uid,
+        username: name,
+        bytes: r.bytes_total,
+        share: r.share_percent,
+      };
+    });
+  const flowProtoRollup = rollupFlowProtocols(snap);
 
   const sumPidPts = sumBytesPtsWithTs(sess.sumPidBytesHist);
   const sumUserPts = sumBytesPtsWithTs(sess.sumUserBytesHist);
@@ -183,19 +219,11 @@ export function AnalyticsView({ snap, sess }: Props) {
     <>
       <h1 className="page-title">Analytics</h1>
       <p className="page-sub">
-        <strong>{snap.iface}</strong> · kernel stack, sockets, conntrack, and collector timing · tick{" "}
-        {new Date(snap.ts_unix_ms).toLocaleTimeString()}
-        <span style={{ color: "var(--muted)" }}>
-          {" "}
-          — time series use your UI session clock (s); absolute values are from the latest snapshot.
-        </span>
+        <strong>{snap.iface}</strong> · tick {new Date(snap.ts_unix_ms).toLocaleTimeString()}
       </p>
 
       <div className="section">
         <h3>Snapshot: sockets &amp; eBPF pressure</h3>
-        <p className="page-sub" style={{ marginBottom: 10 }}>
-          Current tick from <code>/proc</code> and collector-filled maps.
-        </p>
         <div className="strip" style={{ marginBottom: 10 }}>
           <span className="pill" title="/proc/net/sockstat-style pressure">
             TCP in use<strong>{snap.socket_pressure?.tcp_inuse ?? "—"}</strong>
@@ -225,15 +253,21 @@ export function AnalyticsView({ snap, sess }: Props) {
         <div className="grid-cards" style={{ marginBottom: 12 }}>
           <div className="card-num">
             <div className="label">Conntrack count</div>
-            <div className="value">{(snap.conntrack?.count ?? 0).toLocaleString()}</div>
+            <div className="value">
+              {snap.conntrack?.sysctl_unavailable ? "n/a" : (snap.conntrack?.count ?? 0).toLocaleString()}
+            </div>
           </div>
           <div className="card-num">
             <div className="label">Conntrack max</div>
-            <div className="value">{(snap.conntrack?.max ?? 0).toLocaleString()}</div>
+            <div className="value">
+              {snap.conntrack?.sysctl_unavailable ? "n/a" : (snap.conntrack?.max ?? 0).toLocaleString()}
+            </div>
           </div>
           <div className="card-num">
             <div className="label">Conntrack util %</div>
-            <div className="value">{(snap.conntrack?.utilization_percent ?? 0).toFixed(1)}</div>
+            <div className="value">
+              {snap.conntrack?.sysctl_unavailable ? "n/a" : `${(snap.conntrack?.utilization_percent ?? 0).toFixed(1)}`}
+            </div>
           </div>
           <div className="card-num">
             <div className="label">Softnet Σ dropped</div>
@@ -264,27 +298,66 @@ export function AnalyticsView({ snap, sess }: Props) {
             <div className="value">{(snap.collector_tick?.ss_enrich_ms ?? 0).toLocaleString()}</div>
           </div>
         </div>
+        <p style={{ color: "var(--muted)", fontSize: "0.78rem", marginBottom: 10, lineHeight: 1.45 }}>
+          <strong>Conntrack</strong> count/max/util need <code>nf_conntrack</code> (sysctls under{" "}
+          <code>/proc/sys/net/netfilter/</code>) — otherwise they show <strong>n/a</strong>.{" "}
+          <strong>Softnet</strong> is kernel softirq net_rx pressure (Σ = cumulative counter; Δ = change this tick).{" "}
+          <strong>Tick / proc / ss / nft</strong> are how long this collector tick spent in those steps (ms).
+        </p>
         {(() => {
-          const nic =
-            snap.nic_stats?.find((r) => r.ifname === snap.iface) ?? snap.nic_stats?.[0] ?? null;
-          const nd =
-            snap.nic_stats_delta?.find((r) => r.ifname === nic?.ifname) ?? snap.nic_stats_delta?.[0] ?? null;
-          if (!nic) return null;
-          return (
-            <p style={{ color: "var(--muted)", fontSize: "0.82rem", marginBottom: 10 }}>
-              NIC <strong>{nic.ifname}</strong> · rx/tx packets {nic.rx_packets.toLocaleString()} /{" "}
-              {nic.tx_packets.toLocaleString()} · rx_drop Δ {nd?.rx_dropped ?? 0} · tx_drop Δ {nd?.tx_dropped ?? 0} ·
-              rx_err Δ {nd?.rx_errors ?? 0} · tx_err Δ {nd?.tx_errors ?? 0}
-            </p>
-          );
+          const names = monitoredIfaceNames(snap);
+          const lines = names
+            .map((name) => {
+              const nic = snap.nic_stats?.find((r) => r.ifname === name);
+              if (!nic) return null;
+              const nd = snap.nic_stats_delta?.find((r) => r.ifname === name);
+              return (
+                <p key={name} style={{ color: "var(--muted)", fontSize: "0.82rem", marginBottom: 10 }}>
+                  NIC <strong>{nic.ifname}</strong> · rx/tx packets {nic.rx_packets.toLocaleString()} /{" "}
+                  {nic.tx_packets.toLocaleString()} · rx_drop Δ {nd?.rx_dropped ?? 0} · tx_drop Δ {nd?.tx_dropped ?? 0} ·
+                  rx_err Δ {nd?.rx_errors ?? 0} · tx_err Δ {nd?.tx_errors ?? 0}
+                </p>
+              );
+            })
+            .filter(Boolean);
+          if (lines.length === 0) return null;
+          return <>{lines}</>;
         })()}
         {snap.socket_table_lines && (
           <p style={{ color: "var(--muted)", fontSize: "0.82rem", marginBottom: 10 }}>
-            Socket rows: TCP {snap.socket_table_lines.tcp ?? 0} / TCP6 {snap.socket_table_lines.tcp6 ?? 0} · UDP{" "}
-            {snap.socket_table_lines.udp ?? 0} / UDP6 {snap.socket_table_lines.udp6 ?? 0} · unix{" "}
+            Socket rows (/proc tables): TCP {snap.socket_table_lines.tcp ?? 0} / TCP6 {snap.socket_table_lines.tcp6 ?? 0}{" "}
+            · UDP {snap.socket_table_lines.udp ?? 0} / UDP6 {snap.socket_table_lines.udp6 ?? 0} · RAW{" "}
+            {snap.socket_table_lines.raw ?? 0} / RAW6 {snap.socket_table_lines.raw6 ?? 0} · unix{" "}
             {snap.socket_table_lines.unix ?? 0}
           </p>
         )}
+        {flowProtoRollup.length > 0 ? (
+          <div style={{ marginBottom: 12 }}>
+            <h4 style={{ margin: "0 0 6px", fontSize: "0.9rem" }}>Flow protocols (this tick, RX+TX)</h4>
+            <div className="table-wrap">
+              <table className="flows">
+                <thead>
+                  <tr>
+                    <th>Protocol</th>
+                    <th>Bytes</th>
+                    <th>Flow rows</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {flowProtoRollup.slice(0, 24).map((r) => (
+                    <tr key={r.proto}>
+                      <td>
+                        <code>{r.proto}</code>
+                      </td>
+                      <td>{fmtBytes(r.bytes)}</td>
+                      <td>{r.flows.toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : null}
         {nonzeroRecordEntries(snap.tcp_handshake_delta as Record<string, number> | undefined, 6).length > 0 && (
           <div style={{ marginBottom: 10 }}>
             <h4 style={{ margin: "0 0 6px", fontSize: "0.9rem" }}>TCP handshake Δ (this interval)</h4>
@@ -379,22 +452,23 @@ export function AnalyticsView({ snap, sess }: Props) {
       {(snap.unknown_attribution_buckets?.length ?? 0) > 0 && (
         <div className="section">
           <h3>Unknown attribution buckets</h3>
-          <p className="page-sub" style={{ marginBottom: 8 }}>
-            Grouped reasons for flows without PID (or partial attribution), from the collector tick.
-          </p>
           <div className="table-wrap">
             <table className="flows">
               <thead>
                 <tr>
-                  <th>Kind</th>
-                  <th>Count</th>
+                  <th>Reason code</th>
+                  <th>Rows</th>
+                  <th>Bytes</th>
+                  <th>Hint</th>
                 </tr>
               </thead>
               <tbody>
                 {(snap.unknown_attribution_buckets ?? []).map((b) => (
                   <tr key={b.kind}>
-                    <td>{b.kind}</td>
+                    <td style={{ fontFamily: "var(--mono)", fontSize: "0.82rem" }}>{b.kind}</td>
                     <td>{b.count.toLocaleString()}</td>
+                    <td>{fmtBytes(b.bytes ?? 0)}</td>
+                    <td style={{ fontSize: "0.78rem", lineHeight: 1.45, maxWidth: 480 }}>{b.hint ?? ""}</td>
                   </tr>
                 ))}
               </tbody>
@@ -405,26 +479,21 @@ export function AnalyticsView({ snap, sess }: Props) {
 
       <div className="section">
         <h3>Processes &amp; users</h3>
-        <p className="page-sub" style={{ marginBottom: 12 }}>
-          <strong>Bar charts</strong> use the latest snapshot&apos;s top talkers. <strong>Line charts</strong> sum
-          attributed bytes across <em>all</em> PIDs or UIDs each tick (session clock), so the curve tracks total
-          correlated volume even when the #1 process changes. Line charts include a brush to zoom time; hover shows
-          wall-clock time and change vs the previous sample.
-        </p>
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(380px, 1fr))",
-            gap: 16,
+            gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)",
+            gap: 20,
             marginBottom: 16,
+            alignItems: "stretch",
           }}
         >
-          <div className="chart-card">
+          <div className="chart-card" style={{ minWidth: 0 }}>
             <div className="chart-title">Top processes by bytes (this tick)</div>
-            <div style={{ height: Math.min(440, 32 * Math.max(procBars.length, 1)) }}>
+            <div style={{ height: Math.min(520, 36 + Math.max(procBars.length, 1) * 34) }}>
               {procBars.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart layout="vertical" data={procBars} margin={{ left: 8, right: 16, top: 8, bottom: 8 }}>
+                  <BarChart layout="vertical" data={procBars} margin={{ left: 4, right: 20, top: 8, bottom: 8 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#2a3848" horizontal />
                     <XAxis
                       type="number"
@@ -433,12 +502,27 @@ export function AnalyticsView({ snap, sess }: Props) {
                       fontSize={11}
                       tickFormatter={(v) => fmtBytes(v)}
                     />
-                    <YAxis type="category" dataKey="label" stroke="#6b7a90" fontSize={10} width={150} tickLine={false} />
+                    <YAxis
+                      type="category"
+                      dataKey="barKey"
+                      stroke="#6b7a90"
+                      fontSize={10}
+                      width={200}
+                      tickLine={false}
+                      interval={0}
+                      tickFormatter={(k) => procBars.find((p) => p.barKey === k)?.label ?? String(k)}
+                    />
                     <Tooltip
                       content={procBarTooltipContent(snap.ts_unix_ms, snap.iface)}
                       cursor={{ fill: "rgba(77, 163, 255, 0.08)" }}
                     />
-                    <Bar dataKey="bytes" fill="#4da3ff" radius={[0, 4, 4, 0]} maxBarSize={22} />
+                    <Bar
+                      {...BAR_CHART_STATIC}
+                      dataKey="bytes"
+                      fill="#4da3ff"
+                      radius={[0, 4, 4, 0]}
+                      maxBarSize={24}
+                    />
                   </BarChart>
                 </ResponsiveContainer>
               ) : (
@@ -446,12 +530,12 @@ export function AnalyticsView({ snap, sess }: Props) {
               )}
             </div>
           </div>
-          <div className="chart-card">
+          <div className="chart-card" style={{ minWidth: 0 }}>
             <div className="chart-title">Top users by bytes (this tick)</div>
-            <div style={{ height: Math.min(440, 32 * Math.max(userBars.length, 1)) }}>
+            <div style={{ height: Math.min(520, 36 + Math.max(userBars.length, 1) * 34) }}>
               {userBars.length > 0 ? (
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart layout="vertical" data={userBars} margin={{ left: 8, right: 16, top: 8, bottom: 8 }}>
+                  <BarChart layout="vertical" data={userBars} margin={{ left: 4, right: 20, top: 8, bottom: 8 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#2a3848" horizontal />
                     <XAxis
                       type="number"
@@ -460,12 +544,27 @@ export function AnalyticsView({ snap, sess }: Props) {
                       fontSize={11}
                       tickFormatter={(v) => fmtBytes(v)}
                     />
-                    <YAxis type="category" dataKey="label" stroke="#6b7a90" fontSize={10} width={150} tickLine={false} />
+                    <YAxis
+                      type="category"
+                      dataKey="barKey"
+                      stroke="#6b7a90"
+                      fontSize={10}
+                      width={200}
+                      tickLine={false}
+                      interval={0}
+                      tickFormatter={(k) => userBars.find((u) => u.barKey === k)?.label ?? String(k)}
+                    />
                     <Tooltip
                       content={userBarTooltipContent(snap.ts_unix_ms, snap.iface)}
                       cursor={{ fill: "rgba(126, 200, 168, 0.1)" }}
                     />
-                    <Bar dataKey="bytes" fill="#7ec8a8" radius={[0, 4, 4, 0]} maxBarSize={22} />
+                    <Bar
+                      {...BAR_CHART_STATIC}
+                      dataKey="bytes"
+                      fill="#7ec8a8"
+                      radius={[0, 4, 4, 0]}
+                      maxBarSize={24}
+                    />
                   </BarChart>
                 </ResponsiveContainer>
               ) : (
@@ -497,12 +596,10 @@ export function AnalyticsView({ snap, sess }: Props) {
                     />
                     <Tooltip content={sessTt.sumPidBytes} cursor={TOOLTIP_CURSOR_LINE} />
                     <Line
-                      type="monotone"
+                      {...LINE_CHART_STATIC}
                       dataKey="bytes"
                       name="Σ bytes"
                       stroke="#4da3ff"
-                      dot={false}
-                      strokeWidth={2}
                       activeDot={LINE_ACTIVE_DOT}
                     />
                     <Brush dataKey="t" height={18} stroke="#4a6078" fill="rgba(18,24,32,0.65)" travellerWidth={9} />
@@ -529,12 +626,10 @@ export function AnalyticsView({ snap, sess }: Props) {
                     />
                     <Tooltip content={sessTt.sumUserBytes} cursor={TOOLTIP_CURSOR_LINE} />
                     <Line
-                      type="monotone"
+                      {...LINE_CHART_STATIC}
                       dataKey="bytes"
                       name="Σ bytes"
                       stroke="#7ec8a8"
-                      dot={false}
-                      strokeWidth={2}
                       activeDot={LINE_ACTIVE_DOT}
                     />
                     <Brush dataKey="t" height={18} stroke="#4a6078" fill="rgba(18,24,32,0.65)" travellerWidth={9} />
@@ -550,10 +645,6 @@ export function AnalyticsView({ snap, sess }: Props) {
 
       <div className="section">
         <h3>Session time series</h3>
-        <p className="page-sub" style={{ marginBottom: 12 }}>
-          Built in the UI from successive snapshots (same session as Dashboard throughput). Drag the brush under a chart
-          to zoom the session time axis; tooltips show wall-clock time and change vs the previous sample.
-        </p>
         <div
           style={{
             display: "grid",
@@ -572,12 +663,10 @@ export function AnalyticsView({ snap, sess }: Props) {
                     <YAxis stroke="#6b7a90" fontSize={11} domain={domainCtUtil(sess.ctUtilHist)} />
                     <Tooltip content={sessTt.ctUtil} cursor={TOOLTIP_CURSOR_LINE} />
                     <Line
-                      type="monotone"
+                      {...LINE_CHART_STATIC}
                       dataKey="util"
                       name="Utilization %"
                       stroke="#7eb8ff"
-                      dot={false}
-                      strokeWidth={2}
                       activeDot={LINE_ACTIVE_DOT}
                     />
                     <Brush dataKey="t" height={18} stroke="#4a6078" fill="rgba(18,24,32,0.65)" travellerWidth={9} />
@@ -599,12 +688,10 @@ export function AnalyticsView({ snap, sess }: Props) {
                     <YAxis stroke="#6b7a90" fontSize={11} domain={domainNonnegHist(sess.ctInsertHist, 10)} />
                     <Tooltip content={sessTt.ctInsertFailed} cursor={TOOLTIP_CURSOR_LINE} />
                     <Line
-                      type="monotone"
+                      {...LINE_CHART_STATIC}
                       dataKey="ins_fail"
                       name="insert_failed Δ"
                       stroke="#e7a23d"
-                      dot={false}
-                      strokeWidth={2}
                       activeDot={LINE_ACTIVE_DOT}
                     />
                     <Brush dataKey="t" height={18} stroke="#4a6078" fill="rgba(18,24,32,0.65)" travellerWidth={9} />
@@ -626,12 +713,10 @@ export function AnalyticsView({ snap, sess }: Props) {
                     <YAxis stroke="#6b7a90" fontSize={11} domain={domainNonnegHist(sess.nicDropHist, 12)} />
                     <Tooltip content={sessTt.nicRxDrop} cursor={TOOLTIP_CURSOR_LINE} />
                     <Line
-                      type="monotone"
+                      {...LINE_CHART_STATIC}
                       dataKey="rx_drop"
                       name="RX dropped Δ"
                       stroke="#f06b6b"
-                      dot={false}
-                      strokeWidth={2}
                       activeDot={LINE_ACTIVE_DOT}
                     />
                     <Brush dataKey="t" height={18} stroke="#4a6078" fill="rgba(18,24,32,0.65)" travellerWidth={9} />
@@ -653,12 +738,10 @@ export function AnalyticsView({ snap, sess }: Props) {
                     <YAxis stroke="#6b7a90" fontSize={11} domain={domainNonnegHist(sess.softnetHist, 10)} />
                     <Tooltip content={sessTt.softnetDropped} cursor={TOOLTIP_CURSOR_LINE} />
                     <Line
-                      type="monotone"
+                      {...LINE_CHART_STATIC}
                       dataKey="dropped"
                       name="dropped Δ"
                       stroke="#c49aed"
-                      dot={false}
-                      strokeWidth={2}
                       activeDot={LINE_ACTIVE_DOT}
                     />
                     <Brush dataKey="t" height={18} stroke="#4a6078" fill="rgba(18,24,32,0.65)" travellerWidth={9} />
@@ -685,21 +768,17 @@ export function AnalyticsView({ snap, sess }: Props) {
                     <Tooltip content={sessTt.tcpRetransPolicyDrops} cursor={TOOLTIP_CURSOR_LINE} />
                     <Legend />
                     <Line
-                      type="monotone"
+                      {...LINE_CHART_STATIC}
                       dataKey="retrans"
                       name="TCP retrans Δ"
                       stroke="#4da3ff"
-                      dot={false}
-                      strokeWidth={2}
                       activeDot={LINE_ACTIVE_DOT}
                     />
                     <Line
-                      type="monotone"
+                      {...LINE_CHART_STATIC}
                       dataKey="drops"
                       name="Policy drops Δ"
                       stroke="#3ecf8e"
-                      dot={false}
-                      strokeWidth={2}
                       activeDot={LINE_ACTIVE_DOT}
                     />
                     <Brush dataKey="t" height={18} stroke="#4a6078" fill="rgba(18,24,32,0.65)" travellerWidth={9} />
@@ -727,21 +806,17 @@ export function AnalyticsView({ snap, sess }: Props) {
                     <Tooltip content={sessTt.pktPps} cursor={TOOLTIP_CURSOR_LINE} />
                     <Legend />
                     <Line
-                      type="monotone"
+                      {...LINE_CHART_STATIC}
                       dataKey="rx_pps"
                       name="RX pps"
                       stroke="#4da3ff"
-                      dot={false}
-                      strokeWidth={2}
                       activeDot={LINE_ACTIVE_DOT}
                     />
                     <Line
-                      type="monotone"
+                      {...LINE_CHART_STATIC}
                       dataKey="tx_pps"
                       name="TX pps"
                       stroke="#3ecf8e"
-                      dot={false}
-                      strokeWidth={2}
                       activeDot={LINE_ACTIVE_DOT}
                     />
                     <Brush dataKey="t" height={18} stroke="#4a6078" fill="rgba(18,24,32,0.65)" travellerWidth={9} />

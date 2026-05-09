@@ -227,8 +227,10 @@ pub fn read_softnet_signals() -> SoftnetSignals {
 }
 
 pub fn read_conntrack_signals() -> ConntrackSignals {
+    let max_path = "/proc/sys/net/netfilter/nf_conntrack_max";
+    let sysctl_unavailable = !std::path::Path::new(max_path).exists();
     let count = read_u64_file("/proc/sys/net/netfilter/nf_conntrack_count");
-    let max = read_u64_file("/proc/sys/net/netfilter/nf_conntrack_max");
+    let max = read_u64_file(max_path);
     let utilization_percent = if max == 0 {
         0.0
     } else {
@@ -238,6 +240,7 @@ pub fn read_conntrack_signals() -> ConntrackSignals {
         count,
         max,
         utilization_percent,
+        sysctl_unavailable,
     }
 }
 
@@ -303,6 +306,14 @@ pub fn read_nic_stats(iface: &str) -> Vec<NicStatRow> {
         rx_errors: read_u64_file(&format!("{base}/rx_errors")),
         tx_errors: read_u64_file(&format!("{base}/tx_errors")),
     }]
+}
+
+pub fn read_nic_stats_many(ifaces: &[String]) -> Vec<NicStatRow> {
+    let mut out = Vec::with_capacity(ifaces.len());
+    for iface in ifaces {
+        out.extend(read_nic_stats(iface));
+    }
+    out
 }
 
 pub fn nic_stats_delta(prev: &[NicStatRow], cur: &[NicStatRow]) -> Vec<NicStatRow> {

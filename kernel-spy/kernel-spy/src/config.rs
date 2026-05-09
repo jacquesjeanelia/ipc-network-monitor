@@ -1,5 +1,6 @@
 //! cli flags plus optional toml — one place for daemon settings
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -7,15 +8,17 @@ use anyhow::Context;
 use clap::Parser;
 use serde::Deserialize;
 
+use crate::netdev;
+
 #[derive(Debug, Parser, Clone)]
 #[command(
     name = "kernel-spy",
     about = "IPC network monitor and controller (privileged collector daemon)"
 )]
 pub struct Cli {
-    /// iface for xdp + tc
-    #[arg(short, long, default_value = "eth0")]
-    pub iface: String,
+    /// netdev(s) for XDP + TC — comma-separated or repeated `-i`. If omitted, every name under `/sys/class/net` is used.
+    #[arg(short, long, value_delimiter = ',')]
+    pub iface: Vec<String>,
 
     /// optional toml; explicit cli wins on overlaps
     #[arg(long)]
@@ -173,6 +176,8 @@ pub struct Cli {
 #[allow(dead_code)]
 pub struct ConfigFile {
     pub iface: Option<String>,
+    /// when set and non-empty, overrides `iface` for the list of attach targets
+    pub ifaces: Option<Vec<String>>,
     pub interval_secs: Option<u64>,
     pub xdp_mode: Option<String>,
     pub export_socket: Option<PathBuf>,
@@ -358,4 +363,57 @@ pub fn effective(cli: &Cli, file: &Option<ConfigFile>) -> EffectiveConfig {
             .and_then(|x| x.policy_sim_high_uncertain_ratio)
             .unwrap_or(cli.policy_sim_high_uncertain_ratio),
     }
+}
+
+fn parse_iface_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn dedupe_monitor_ifaces(mut names: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    names.retain(|n| seen.insert(n.clone()));
+    names
+}
+
+/// TOML `ifaces` / `iface` wins when present and non-empty; otherwise CLI `-i`; if still empty, all of `/sys/class/net`.
+pub fn resolve_monitor_ifaces(cli: &Cli, file: &Option<ConfigFile>) -> Vec<String> {
+    let from_toml = file.as_ref().and_then(|f| {
+        if let Some(ref arr) = f.ifaces {
+            if !arr.is_empty() {
+                let v: Vec<String> = arr
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        f.iface
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(parse_iface_csv)
+    });
+    let merged = if let Some(v) = from_toml {
+        v
+    } else {
+        let mut all = Vec::new();
+        for part in &cli.iface {
+            all.extend(parse_iface_csv(part));
+        }
+        all
+    };
+    let mut out = dedupe_monitor_ifaces(merged);
+    if out.is_empty() {
+        out = netdev::list_class_net_ifaces();
+    }
+    if out.is_empty() {
+        out.push("eth0".into());
+    }
+    out
 }

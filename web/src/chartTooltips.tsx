@@ -87,10 +87,6 @@ export function formatSeriesByDataKey(dataKey: string | number | undefined, valu
   return String(n);
 }
 
-function tooltipSkipFieldKey(k: string, seriesKeys: Set<string>): boolean {
-  return k === "t" || k === "ts_ms" || k === "idx" || seriesKeys.has(k) || k.endsWith("_d_prev");
-}
-
 export function sessionLineTooltipContent(opts?: {
   title?: string;
   hint?: string;
@@ -100,12 +96,7 @@ export function sessionLineTooltipContent(opts?: {
   return function SessionLineTooltip({ active, payload, label }: RechartsTooltipArgs) {
     if (!active || !payload?.length) return null;
     const row = (payload[0]?.payload ?? {}) as Record<string, unknown>;
-    const seriesKeys = new Set(
-      payload.map((p) => (typeof p.dataKey === "string" || typeof p.dataKey === "number" ? String(p.dataKey) : "")),
-    );
-    const extra = Object.entries(row).filter(([k]) => !tooltipSkipFieldKey(k, seriesKeys));
     const tsWall = num(row.ts_ms);
-    const idx = num(row.idx);
 
     return (
       <div style={TOOLTIP_PANEL}>
@@ -120,12 +111,6 @@ export function sessionLineTooltipContent(opts?: {
         <div style={{ fontWeight: 600, marginBottom: 4, color: "#c8d4e0" }}>
           Session time <span style={{ fontFamily: "var(--mono)", color: "#fff" }}>t = {label}s</span>
         </div>
-        {typeof idx === "number" && idx >= 0 ? (
-          <div style={{ fontSize: 10, color: "#7a8a9c", marginBottom: 6 }}>
-            Rolling window sample · <span style={{ fontFamily: "var(--mono)", color: "#c8d4e0" }}>#{idx + 1}</span>{" "}
-            <span style={{ color: "#5a6a7a" }}>(0 = oldest in window)</span>
-          </div>
-        ) : null}
         {tsWall !== null && tsWall > 0 ? (
           <div style={{ fontSize: 11, color: "#9fb3c8", marginBottom: 8, lineHeight: 1.4 }}>
             Wall clock · <span style={{ fontFamily: "var(--mono)", color: "#e6edf3" }}>{fmtWallClock(tsWall)}</span>
@@ -167,25 +152,6 @@ export function sessionLineTooltipContent(opts?: {
             </div>
           );
         })}
-        {extra.length > 0 ? (
-          <div
-            style={{
-              marginTop: 8,
-              paddingTop: 8,
-              borderTop: "1px solid #273445",
-              fontSize: 11,
-              color: "#8a9aac",
-            }}
-          >
-            <div style={{ fontWeight: 600, marginBottom: 4, color: "#9fb3c8" }}>Other fields</div>
-            {extra.map(([k, v]) => (
-              <div key={k} style={{ display: "flex", justifyContent: "space-between", gap: 14, marginTop: 2 }}>
-                <code style={{ fontSize: 10 }}>{k}</code>
-                <span style={{ fontFamily: "var(--mono)", fontSize: 10 }}>{String(v)}</span>
-              </div>
-            ))}
-          </div>
-        ) : null}
         {hint ? (
           <div style={{ marginTop: 10, fontSize: 10, color: "#6b7a90", lineHeight: 1.4 }}>{hint}</div>
         ) : null}
@@ -199,7 +165,6 @@ export function throughputTooltipContent(iface?: string) {
     if (!active || !payload?.length) return null;
     const row = (payload[0]?.payload ?? {}) as Record<string, unknown>;
     const tsWall = num(row.ts_ms);
-    const idx = num(row.idx);
     return (
       <div style={TOOLTIP_PANEL}>
         <div style={{ fontWeight: 700, marginBottom: 6, color: "#8bd5ff" }}>Throughput</div>
@@ -211,19 +176,11 @@ export function throughputTooltipContent(iface?: string) {
         <div style={{ marginBottom: 4, color: "#c8d4e0" }}>
           Session <span style={{ fontFamily: "var(--mono)", color: "#fff" }}>t = {label}s</span>
         </div>
-        {typeof idx === "number" && idx >= 0 ? (
-          <div style={{ fontSize: 10, color: "#7a8a9c", marginBottom: 6 }}>
-            Rolling window sample · <span style={{ fontFamily: "var(--mono)", color: "#c8d4e0" }}>#{idx + 1}</span>
-          </div>
-        ) : null}
         {tsWall !== null && tsWall > 0 ? (
           <div style={{ fontSize: 11, color: "#9fb3c8", marginBottom: 8, lineHeight: 1.4 }}>
             Wall clock · <span style={{ fontFamily: "var(--mono)", color: "#e6edf3" }}>{fmtWallClock(tsWall)}</span>
           </div>
         ) : null}
-        <div style={{ fontSize: 11, color: "#9fb3c8", marginBottom: 8, lineHeight: 1.4 }}>
-          RX / TX as byte rate from successive collector snapshots (derivative over snap interval).
-        </div>
         {payload.map((p, i) => {
           const dk = String(p.dataKey);
           const dPrev = num(row[`${dk}_d_prev`]);
@@ -262,6 +219,7 @@ export function throughputTooltipContent(iface?: string) {
 }
 
 export type ProcBarRow = {
+  barKey?: string;
   label: string;
   pid: number;
   comm: string;
@@ -301,15 +259,13 @@ export function procBarTooltipContent(snapshotTsMs?: number, iface?: string) {
             <div style={{ fontFamily: "var(--mono)", fontWeight: 700 }}>{d.share.toFixed(2)}%</div>
           </div>
         </div>
-        <div style={{ marginTop: 10, fontSize: 10, color: "#6b7a90", lineHeight: 1.4 }}>
-          Bar height = attributed bytes on <code>{d.label}</code> axis label (latest snapshot).
-        </div>
       </div>
     );
   };
 }
 
 export type UserBarRow = {
+  barKey?: string;
   label: string;
   uid: number;
   username: string;
@@ -349,9 +305,6 @@ export function userBarTooltipContent(snapshotTsMs?: number, iface?: string) {
             <div style={{ fontFamily: "var(--mono)", fontWeight: 700 }}>{d.share.toFixed(2)}%</div>
           </div>
         </div>
-        <div style={{ marginTop: 10, fontSize: 10, color: "#6b7a90", lineHeight: 1.4 }}>
-          Bar height = sum of attributed bytes for this UID (latest snapshot).
-        </div>
       </div>
     );
   };
@@ -361,48 +314,54 @@ export const TOOLTIP_CURSOR_LINE = { stroke: "#5a6a80", strokeWidth: 1, strokeDa
 
 export const LINE_ACTIVE_DOT = { r: 5, stroke: "#0c1016", strokeWidth: 2 };
 
+/** Recharts line defaults: linear segments, no tween animation. */
+export const LINE_CHART_STATIC = {
+  type: "linear" as const,
+  isAnimationActive: false,
+  animationDuration: 0,
+  dot: false,
+  strokeWidth: 2,
+} as const;
+
+export const BAR_CHART_STATIC = {
+  isAnimationActive: false,
+  animationDuration: 0,
+} as const;
+
 /** Tooltips for Analytics session charts; memoize per `iface` in the view so identities stay stable. */
 export function analyticsSessionTooltipsFor(iface: string) {
   const ifc = iface.trim() || "—";
   return {
     sumPidBytes: sessionLineTooltipContent({
       title: "Σ PID-attributed bytes / tick",
-      hint: "Sum of per-PID attributed bytes each collector tick. X-axis t is UI session time in seconds.",
       iface: ifc,
     }),
     sumUserBytes: sessionLineTooltipContent({
       title: "Σ user-attributed bytes / tick",
-      hint: "Sum of per-UID attributed bytes each tick. X-axis t is UI session time in seconds.",
       iface: ifc,
     }),
     ctUtil: sessionLineTooltipContent({
       title: "Conntrack utilization",
-      hint: "nf_conntrack count ÷ max from each snapshot, expressed as percent.",
       iface: ifc,
     }),
     ctInsertFailed: sessionLineTooltipContent({
       title: "Conntrack insert_failed",
-      hint: "Per-tick Δ of insert_failed from conntrack counters (failures to add a new entry).",
       iface: ifc,
     }),
     nicRxDrop: sessionLineTooltipContent({
       title: "NIC RX dropped (Δ)",
-      hint: "Per-tick increase in rx_dropped summed across monitored NIC rows from /proc/net/dev.",
       iface: ifc,
     }),
     softnetDropped: sessionLineTooltipContent({
       title: "Softnet dropped (Δ)",
-      hint: "Per-tick Δ of softnet dropped stat (kernel softirq net_rx path pressure).",
       iface: ifc,
     }),
     tcpRetransPolicyDrops: sessionLineTooltipContent({
       title: "TCP retransmit vs policy drops",
-      hint: "Per-tick Δ: tcp_retransmit_skb (left axis series) and policy_drops from health counters.",
       iface: ifc,
     }),
     pktPps: sessionLineTooltipContent({
       title: "Packet rate (iface)",
-      hint: "RX/TX packets per second derived from /proc/net/dev packet counters over the collector interval.",
       iface: ifc,
     }),
   };

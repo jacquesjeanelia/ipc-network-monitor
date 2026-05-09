@@ -27,9 +27,9 @@ use aya::programs::{
 use clap::Parser;
 use common::{
     CollectorCacheMeta, CollectorTickMetrics, ConntrackSignalsDelta,
-    DirectionTotals, EbpfFlowMapStats, ExportLine, FlowRow, HealthSnapshot, IpFragSignals,
-    MonitorSnapshotV1, NicStatRow, ProbeStatus, SCHEMA_VERSION, SessionInfo, SoftnetSignals,
-    TcpHandshakeSignals, TcpKernelSignals,
+    DirectionTotals, EbpfFlowMapStats, ExportLine, FlowProtocolTotals, FlowRow, HealthSnapshot,
+    IpFragSignals, MonitorSnapshotV1, NicStatRow, ProbeStatus, SCHEMA_VERSION, SessionInfo,
+    SoftnetSignals, TcpHandshakeSignals, TcpKernelSignals,
 };
 use kernel_spy_common::{HealthCounterIndex, PacketMetadata, PacketMetadataV6};
 use log::{debug, warn};
@@ -213,11 +213,19 @@ fn collect_flow_rows_v6<T: Borrow<MapData>>(
     Ok(out)
 }
 
-/// merge ipv4 + ipv6 flow rows, sort by bytes, keep top `max_rows` for export
+/// merge ipv4 + ipv6 flow rows, sort by bytes, keep top `max_rows` for export (tests / callers that cap explicitly).
+#[allow(dead_code)]
 fn merge_flow_rows_by_bytes(mut a: Vec<FlowRow>, b: Vec<FlowRow>, max_rows: usize) -> Vec<FlowRow> {
     a.extend(b);
     a.sort_by(|x, y| y.bytes.cmp(&x.bytes));
     a.truncate(max_rows);
+    a
+}
+
+/// Merge v4+v6 flow rows, sort by bytes (no cap). Used for per-PID/UID aggregates over the full eBPF map sample.
+fn merge_flow_rows_sorted(mut a: Vec<FlowRow>, b: Vec<FlowRow>) -> Vec<FlowRow> {
+    a.extend(b);
+    a.sort_by(|x, y| y.bytes.cmp(&x.bytes));
     a
 }
 
@@ -227,6 +235,43 @@ fn count_flow_map_entries<T: Borrow<MapData>>(m: &HashMap<T, PacketMetadata, u64
 
 fn count_flow_map_entries_v6<T: Borrow<MapData>>(m: &HashMap<T, PacketMetadataV6, u64>) -> usize {
     m.iter().filter_map(|e| e.ok()).count()
+}
+
+fn add_ip_proto_bytes(t: &mut FlowProtocolTotals, protocol: u8, bytes: u64) {
+    match protocol {
+        6 => t.tcp_bytes = t.tcp_bytes.saturating_add(bytes),
+        17 => t.udp_bytes = t.udp_bytes.saturating_add(bytes),
+        1 => t.icmp_bytes = t.icmp_bytes.saturating_add(bytes),
+        58 => t.icmpv6_bytes = t.icmpv6_bytes.saturating_add(bytes),
+        2 => t.igmp_bytes = t.igmp_bytes.saturating_add(bytes),
+        47 => t.gre_bytes = t.gre_bytes.saturating_add(bytes),
+        132 => t.sctp_bytes = t.sctp_bytes.saturating_add(bytes),
+        50 => t.esp_bytes = t.esp_bytes.saturating_add(bytes),
+        51 => t.ah_bytes = t.ah_bytes.saturating_add(bytes),
+        _ => t.other_bytes = t.other_bytes.saturating_add(bytes),
+    }
+}
+
+fn tally_flow_protocol_totals<T4: Borrow<MapData>, T6: Borrow<MapData>>(
+    ip_rx: &HashMap<T4, PacketMetadata, u64>,
+    ip_tx: &HashMap<T4, PacketMetadata, u64>,
+    ip6_rx: &HashMap<T6, PacketMetadataV6, u64>,
+    ip6_tx: &HashMap<T6, PacketMetadataV6, u64>,
+) -> FlowProtocolTotals {
+    let mut t = FlowProtocolTotals::default();
+    for m in [ip_rx, ip_tx] {
+        for e in m.iter().filter_map(|x| x.ok()) {
+            let (meta, bytes) = e;
+            add_ip_proto_bytes(&mut t, meta.protocol, bytes);
+        }
+    }
+    for m in [ip6_rx, ip6_tx] {
+        for e in m.iter().filter_map(|x| x.ok()) {
+            let (meta, bytes) = e;
+            add_ip_proto_bytes(&mut t, meta.protocol, bytes);
+        }
+    }
+    t
 }
 
 #[tokio::main]
@@ -246,10 +291,8 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|f| f.skip_tcp_retransmit_trace)
             .unwrap_or(false);
 
-    let iface = file_cfg
-        .as_ref()
-        .and_then(|f| f.iface.clone())
-        .unwrap_or_else(|| cli.iface.clone());
+    let ifaces = config::resolve_monitor_ifaces(&cli, &file_cfg);
+    let iface_display = ifaces.join("+");
     let xdp_mode = file_cfg
         .as_ref()
         .and_then(|f| f.xdp_mode.clone())
@@ -313,13 +356,15 @@ async fn main() -> anyhow::Result<()> {
     let mut tc_egress_attached = false;
     let mut tcp_retransmit_trace_attached = false;
 
-    if !netdev::iface_exists(&iface) {
-        let msg = format!(
-            "iface {iface:?} is missing under /sys/class/net — eBPF will not count traffic on that name. \
-             Many desktops use enp*/wlp*/wlan0, not eth0; pick the device from your default route (e.g. `ip route get 1.1.1.1`) and pass `-i` / `--iface`."
-        );
-        warn!("{msg}");
-        probe_errors.push(msg);
+    for ifn in &ifaces {
+        if !netdev::iface_exists(ifn) {
+            let msg = format!(
+                "iface {ifn:?} is missing under /sys/class/net — eBPF will not count traffic on that name. \
+                 Many desktops use enp*/wlp*/wlan0, not eth0; pick the device from your default route (e.g. `ip route get 1.1.1.1`) and pass `-i` / `--iface`."
+            );
+            warn!("{msg}");
+            probe_errors.push(msg);
+        }
     }
 
     if force_attach_fail {
@@ -330,21 +375,30 @@ async fn main() -> anyhow::Result<()> {
             Some(program) => {
                 let program: &mut Xdp = program.try_into()?;
                 program.load()?;
-                for (mode_name, flags) in xdp_attempts {
-                    match program.attach(&iface, flags) {
-                        Ok(_link_id) => {
-                            xdp_attached = true;
-                            log::info!("Attached XDP ({mode_name}) to ingress of {}", iface);
-                            break;
+                for ifn in &ifaces {
+                    let mut attached_here = false;
+                    for (mode_name, flags) in &xdp_attempts {
+                        match program.attach(ifn, *flags) {
+                            Ok(_link_id) => {
+                                attached_here = true;
+                                xdp_attached = true;
+                                log::info!("Attached XDP ({mode_name}) to ingress of {ifn}");
+                                break;
+                            }
+                            Err(e) => {
+                                probe_errors.push(format!("XDP {mode_name} on {ifn}: {e:#}"));
+                                warn!("XDP {mode_name} attach on {ifn} failed (degraded): {e:#}");
+                            }
                         }
-                        Err(e) => {
-                            probe_errors.push(format!("XDP {mode_name} attach failed: {e:#}"));
-                            warn!("XDP {mode_name} attach failed (degraded): {e:#}");
-                        }
+                    }
+                    if !attached_here {
+                        probe_errors.push(format!(
+                            "XDP attach failed in all fallback modes on {ifn}; no ingress count from that iface"
+                        ));
                     }
                 }
                 if !xdp_attached {
-                    probe_errors.push("XDP attach failed in all fallback modes; running degraded".into());
+                    probe_errors.push("XDP attach failed on every monitored interface; running degraded".into());
                 }
             }
             None => {
@@ -353,20 +407,27 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        let _ = qdisc_add_clsact(&iface);
+        for ifn in &ifaces {
+            let _ = qdisc_add_clsact(ifn);
+        }
         match ebpf.program_mut("kernel_spy_tc") {
             Some(program) => {
                 let tc_program: &mut SchedClassifier = program.try_into()?;
                 tc_program.load()?;
-                match tc_program.attach(&iface, TcAttachType::Egress) {
-                    Ok(_link_id) => {
-                        tc_egress_attached = true;
-                        log::info!("Attached TC egress classifier on {}", iface);
+                for ifn in &ifaces {
+                    match tc_program.attach(ifn, TcAttachType::Egress) {
+                        Ok(_link_id) => {
+                            tc_egress_attached = true;
+                            log::info!("Attached TC egress classifier on {ifn}");
+                        }
+                        Err(e) => {
+                            probe_errors.push(format!("TC egress attach on {ifn}: {e:#}"));
+                            warn!("TC egress attach on {ifn} failed (degraded): {e:#}");
+                        }
                     }
-                    Err(e) => {
-                        probe_errors.push(format!("TC egress attach failed: {e:#}"));
-                        warn!("TC egress attach failed (degraded): {e:#}");
-                    }
+                }
+                if !tc_egress_attached {
+                    probe_errors.push("TC egress attach failed on every monitored interface".into());
                 }
             }
             None => {
@@ -479,7 +540,7 @@ async fn main() -> anyhow::Result<()> {
         probe_errors.push("nft: binary not found in PATH".into());
     }
 
-    let mut netem_applied = false;
+    let mut netem_applied_ifaces: Vec<String> = Vec::new();
     if let Some(ref fc) = file_cfg {
         if let Some(ms) = fc.netem_delay_ms {
             if ms > 400 {
@@ -494,27 +555,29 @@ async fn main() -> anyhow::Result<()> {
                     ms
                 );
             }
-            match tc_control::apply_root_netem_delay_ms(&iface, ms) {
-                Ok(()) => {
-                    netem_applied = true;
-                    control::audit(
-                        audit_path.as_deref(),
-                        "tc_netem",
-                        &format!("applied netem delay {ms}ms on {}", iface),
-                        Some("success"),
-                        Some(session_id.as_str()),
-                    )?;
-                }
-                Err(e) => {
-                    probe_errors.push(format!("tc netem apply: {e:#}"));
-                    warn!("tc netem apply failed (degraded): {e:#}");
-                    let _ = control::audit(
-                        audit_path.as_deref(),
-                        "tc_netem",
-                        &format!("failed netem delay {ms}ms on {} err={e:#}", iface),
-                        Some("failure"),
-                        Some(session_id.as_str()),
-                    );
+            for ifn in &ifaces {
+                match tc_control::apply_root_netem_delay_ms(ifn, ms) {
+                    Ok(()) => {
+                        netem_applied_ifaces.push(ifn.clone());
+                        control::audit(
+                            audit_path.as_deref(),
+                            "tc_netem",
+                            &format!("applied netem delay {ms}ms on {ifn}"),
+                            Some("success"),
+                            Some(session_id.as_str()),
+                        )?;
+                    }
+                    Err(e) => {
+                        probe_errors.push(format!("tc netem apply on {ifn}: {e:#}"));
+                        warn!("tc netem apply on {ifn} failed (degraded): {e:#}");
+                        let _ = control::audit(
+                            audit_path.as_deref(),
+                            "tc_netem",
+                            &format!("failed netem delay {ms}ms on {ifn} err={e:#}"),
+                            Some("failure"),
+                            Some(session_id.as_str()),
+                        );
+                    }
                 }
             }
         }
@@ -580,7 +643,7 @@ async fn main() -> anyhow::Result<()> {
         let sid = session_id.clone();
         let sim_for_ctl = sim_cfg.clone();
         let alert_for_ctl = alert_rpc_cfg.clone();
-        let monitor_iface = iface.clone();
+        let monitor_ifaces = Arc::new(ifaces.clone());
         let netem_confirm = eff.netem_confirm;
         tokio::task::spawn(async move {
             control_rpc::serve_control_socket(
@@ -591,7 +654,7 @@ async fn main() -> anyhow::Result<()> {
                 state_dir,
                 audit_ctl,
                 sid,
-                monitor_iface,
+                monitor_ifaces,
                 netem_confirm,
             )
             .await;
@@ -662,10 +725,10 @@ async fn main() -> anyhow::Result<()> {
     println!("=== kernel-spy (collector) status (one-time) ===");
     println!(
         "schema_version={}  iface={}  interval={}s  xdp_mode={}",
-        SCHEMA_VERSION, iface, eff.interval_secs, xdp_mode
+        SCHEMA_VERSION, iface_display, eff.interval_secs, xdp_mode
     );
     println!(
-        "eBPF: XDP ingress + TC egress on iface; health: tcp_retransmit tracepoint {}",
+        "eBPF: XDP ingress + TC egress on monitored netdev(s); health: tcp_retransmit tracepoint {}",
         if skip_tcp_retransmit_trace {
             "off"
         } else if tcp_retransmit_trace_attached {
@@ -719,7 +782,10 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "note: full snapshot (probe_status, session, aggregates, alerts envelope) -> export socket; below is a short sample"
     );
-    if iface == "lo" || iface.starts_with("lo:") {
+    if ifaces
+        .iter()
+        .any(|i| i == "lo" || i.starts_with("lo:"))
+    {
         println!("note: on loopback, RX/TX top-flow samples often look alike (symmetric paths)");
     }
     println!("=================================================");
@@ -740,10 +806,14 @@ async fn main() -> anyhow::Result<()> {
         let rx_totals = read_direction_totals(&monitor_rx);
         let tx_totals = read_direction_totals(&monitor_tx);
         let (tcp_retrans, policy_drops) = read_health(&health);
-        let (nd_rx, nd_tx) = netdev::read_netdev_drops(&iface).unwrap_or((None, None));
+        let (nd_rx, nd_tx) = netdev::read_netdev_drops_sum(&ifaces);
 
+        let mut proc_inode_walk_ms = 0u64;
         let proc_cache = if eff.proc_pid_correlation {
-            Some(proc_corr::InodePidCache::refresh())
+            let t0 = std::time::Instant::now();
+            let c = proc_corr::InodePidCache::refresh();
+            proc_inode_walk_ms = t0.elapsed().as_millis() as u64;
+            Some(c)
         } else {
             None
         };
@@ -757,20 +827,20 @@ async fn main() -> anyhow::Result<()> {
 
         let flows_rx4 = collect_flow_rows(&ip_rx, proc_ref, eff.proc_pid_correlation)?;
         let flows_rx6 = collect_flow_rows_v6(&ip6_rx, proc_ref, eff.proc_pid_correlation)?;
-        let mut flows_rx = merge_flow_rows_by_bytes(flows_rx4, flows_rx6, eff.max_flow_rows);
+        let mut flows_rx_full = merge_flow_rows_sorted(flows_rx4, flows_rx6);
 
         let flows_tx4 = collect_flow_rows(&ip_tx, proc_ref, eff.proc_pid_correlation)?;
         let flows_tx6 = collect_flow_rows_v6(&ip6_tx, proc_ref, eff.proc_pid_correlation)?;
-        let mut flows_tx = merge_flow_rows_by_bytes(flows_tx4, flows_tx6, eff.max_flow_rows);
+        let mut flows_tx_full = merge_flow_rows_sorted(flows_tx4, flows_tx6);
 
-        attr::enrich_flow_rows(&mut flows_rx);
-        attr::enrich_flow_rows(&mut flows_tx);
+        attr::enrich_flow_rows(&mut flows_rx_full);
+        attr::enrich_flow_rows(&mut flows_tx_full);
 
         // Enrich flows missing pid attribution from the eBPF sport→pid map (catches short-lived processes).
         // Map keys are the local TCP sport at SYN_SENT / SYN_RECV / ESTABLISHED; RX packets often have the
         // local ephemeral in `dst_port` (remote:443 → local:ephemeral), so try both ports for TCP/UDP.
         if let Some(ref smap) = sock_sport_pid {
-            for row in flows_rx.iter_mut().chain(flows_tx.iter_mut()) {
+            for row in flows_rx_full.iter_mut().chain(flows_tx_full.iter_mut()) {
                 if row.local_pid.is_some() {
                     continue;
                 }
@@ -793,22 +863,25 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            attr::enrich_flow_rows(&mut flows_rx);
-            attr::enrich_flow_rows(&mut flows_tx);
+            attr::enrich_flow_rows(&mut flows_rx_full);
+            attr::enrich_flow_rows(&mut flows_tx_full);
         }
 
-        let have_any_missing_pid = flows_rx
+        let have_any_missing_pid = flows_rx_full
             .iter()
-            .chain(flows_tx.iter())
+            .chain(flows_tx_full.iter())
             .any(|row| row.local_pid.is_none());
+        let mut ss_enrich_ms = 0u64;
         if eff.ss_enrich || have_any_missing_pid {
-            ss_enrich::enrich_flows_from_ss(&mut flows_rx, &mut flows_tx, eff.ss_netns.as_deref());
-            attr::enrich_flow_rows(&mut flows_rx);
-            attr::enrich_flow_rows(&mut flows_tx);
+            let t0 = std::time::Instant::now();
+            ss_enrich::enrich_flows_from_ss(&mut flows_rx_full, &mut flows_tx_full, eff.ss_netns.as_deref());
+            ss_enrich_ms = t0.elapsed().as_millis() as u64;
+            attr::enrich_flow_rows(&mut flows_rx_full);
+            attr::enrich_flow_rows(&mut flows_tx_full);
         }
 
-        attr::finalize_attribution(&mut flows_rx, eff.ss_netns.as_deref());
-        attr::finalize_attribution(&mut flows_tx, eff.ss_netns.as_deref());
+        attr::finalize_attribution(&mut flows_rx_full, eff.ss_netns.as_deref());
+        attr::finalize_attribution(&mut flows_tx_full, eff.ss_netns.as_deref());
 
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -818,8 +891,18 @@ async fn main() -> anyhow::Result<()> {
         // Calculate total bytes for percentage calculation
         let total_bytes = rx_totals.bytes.saturating_add(tx_totals.bytes);
 
+        // Aggregates over the full sorted map-backed rows so top talkers are not limited to `max_flow_rows`.
         let (aggregates_by_pid, aggregates_by_user) =
-            aggregate::aggregates_from_flows(&flows_rx, &flows_tx, ts, total_bytes);
+            aggregate::aggregates_from_flows(&flows_rx_full, &flows_tx_full, ts, total_bytes);
+
+        let flows_rx: Vec<FlowRow> = flows_rx_full
+            .into_iter()
+            .take(eff.max_flow_rows)
+            .collect();
+        let flows_tx: Vec<FlowRow> = flows_tx_full
+            .into_iter()
+            .take(eff.max_flow_rows)
+            .collect();
 
         // Push current aggregates to history
         aggregate_history.push(&aggregates_by_pid, &aggregates_by_user);
@@ -835,7 +918,7 @@ async fn main() -> anyhow::Result<()> {
         let (conntrack_delta, conntrack_next) =
             kernel_stats::read_conntrack_delta(prev_conntrack_counters.as_ref());
 
-        let nic_stats_cur = kernel_stats::read_nic_stats(&iface);
+        let nic_stats_cur = kernel_stats::read_nic_stats_many(&ifaces);
         let nic_stats_delta = kernel_stats::nic_stats_delta(&prev_nic_stats, &nic_stats_cur);
 
         let tcp_handshake_cur = kernel_stats::read_tcp_handshake_signals();
@@ -875,10 +958,14 @@ async fn main() -> anyhow::Result<()> {
 
         let tick_wall_ms = tick_start.elapsed().as_millis() as u64;
 
+        let unknown_attribution_buckets =
+            attr::compute_attribution_gap_buckets(&flows_rx, &flows_tx);
+
         let snapshot = MonitorSnapshotV1 {
             schema_version: SCHEMA_VERSION,
             ts_unix_ms: ts,
-            iface: iface.clone(),
+            iface: iface_display.clone(),
+            monitored_ifaces: ifaces.clone(),
             rx: rx_totals.clone(),
             tx: tx_totals.clone(),
             health: HealthSnapshot {
@@ -889,6 +976,7 @@ async fn main() -> anyhow::Result<()> {
             },
             flows_rx,
             flows_tx,
+            flow_protocol_totals: tally_flow_protocol_totals(&ip_rx, &ip_tx, &ip6_rx, &ip6_tx),
             probe_status: probe_status_snapshot.clone(),
             session: SessionInfo {
                 session_id: session_id.clone(),
@@ -900,7 +988,7 @@ async fn main() -> anyhow::Result<()> {
             aggregate_history_by_user: aggregate_history.uid_history().to_vec(),
             alerts: tick_alerts,
             attribution_coverage_percent,
-            unknown_attribution_buckets: vec![],
+            unknown_attribution_buckets,
             policy_impact,
             tcp_kernel: tcp_kernel_cur,
             softnet: softnet_cur,
@@ -932,6 +1020,8 @@ async fn main() -> anyhow::Result<()> {
             },
             collector_tick: CollectorTickMetrics {
                 tick_wall_ms,
+                proc_inode_walk_ms,
+                ss_enrich_ms,
                 ..Default::default()
             },
             collector_cache: CollectorCacheMeta {
@@ -1059,9 +1149,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("Exiting...");
-    if netem_applied {
-        if let Err(e) = tc_control::clear_root_qdisc(&iface) {
-            warn!("could not remove netem root qdisc on {}: {e:#}", iface);
+    for ifn in &netem_applied_ifaces {
+        if let Err(e) = tc_control::clear_root_qdisc(ifn) {
+            warn!("could not remove netem root qdisc on {ifn}: {e:#}");
         }
     }
     Ok(())

@@ -52,6 +52,50 @@ fn normalize_warn_crit_pair(warn: &mut u64, crit: &mut u64) {
     }
 }
 
+fn tc_netem_apply_all(ifaces: &[String], delay_ms: u32) -> Result<serde_json::Value, String> {
+    if ifaces.is_empty() {
+        return Err("collector has no monitor interface configured".into());
+    }
+    let mut applied = Vec::new();
+    let mut errs = Vec::new();
+    for iface in ifaces {
+        match tc_control::apply_root_netem_delay_ms(iface, delay_ms) {
+            Ok(()) => applied.push(iface.clone()),
+            Err(e) => errs.push(format!("{iface}: {e:#}")),
+        }
+    }
+    if applied.is_empty() {
+        return Err(errs.join("; "));
+    }
+    Ok(json!({
+        "ifaces": ifaces,
+        "applied_ifaces": applied,
+        "partial_errors": errs,
+    }))
+}
+
+fn tc_netem_clear_all(ifaces: &[String]) -> Result<serde_json::Value, String> {
+    if ifaces.is_empty() {
+        return Err("collector has no monitor interface configured".into());
+    }
+    let mut cleared = Vec::new();
+    let mut errs = Vec::new();
+    for iface in ifaces {
+        match tc_control::clear_root_qdisc(iface) {
+            Ok(()) => cleared.push(iface.clone()),
+            Err(e) => errs.push(format!("{iface}: {e:#}")),
+        }
+    }
+    if cleared.is_empty() {
+        return Err(errs.join("; "));
+    }
+    Ok(json!({
+        "ifaces": ifaces,
+        "cleared_ifaces": cleared,
+        "partial_errors": errs,
+    }))
+}
+
 fn policy_risk_assessment(
     matched_bytes: u64,
     uncertain_ratio: f64,
@@ -426,7 +470,7 @@ async fn handle_line(
     state_dir: &PathBuf,
     audit_path: &Option<PathBuf>,
     session_id: &str,
-    monitor_iface: &str,
+    monitor_ifaces: &[String],
     netem_host_confirm: bool,
 ) -> String {
     let req: ControlRequest = match serde_json::from_str(line.trim()) {
@@ -803,65 +847,69 @@ async fn handle_line(
                     "delay_ms > 2000 requires params.confirm true (SSH/interactive risk); or start collector with --netem-confirm",
                 );
             }
-            if monitor_iface.is_empty() {
-                return respond_err("collector has no monitor interface configured");
-            }
-            let iface = monitor_iface.to_string();
-            let iface_disp = iface.clone();
+            let ifaces = monitor_ifaces.to_vec();
             let ap = audit_path.clone();
-            let res = tokio::task::spawn_blocking(move || tc_control::apply_root_netem_delay_ms(&iface, delay_ms)).await;
+            let res = tokio::task::spawn_blocking(move || tc_netem_apply_all(&ifaces, delay_ms)).await;
             match res {
-                Ok(Ok(())) => {
+                Ok(Ok(data)) => {
                     let _ = control::audit(
                         ap.as_deref(),
                         "tc_netem_apply",
-                        &format!("iface={iface_disp} delay_ms={delay_ms}"),
+                        &format!("delay_ms={delay_ms} data={data}"),
                         Some("success"),
                         sid,
                     );
-                    respond_ok(json!({ "iface": iface_disp, "delay_ms": delay_ms }))
+                    respond_ok(json!({
+                        "delay_ms": delay_ms,
+                        "iface": data["applied_ifaces"].get(0).cloned().unwrap_or(json!(null)),
+                        "ifaces": data["ifaces"],
+                        "applied_ifaces": data["applied_ifaces"],
+                        "partial_errors": data["partial_errors"],
+                    }))
                 }
                 Ok(Err(e)) => {
                     let _ = control::audit(
                         audit_path.as_deref(),
                         "tc_netem_apply",
-                        &format!("iface={iface_disp} delay_ms={delay_ms} err={e:#}"),
+                        &format!("delay_ms={delay_ms} err={e}"),
                         Some("failure"),
                         sid,
                     );
-                    respond_err(e.to_string())
+                    respond_err(e)
                 }
                 Err(e) => respond_err(e.to_string()),
             }
         }
         "tc_netem_clear" => {
-            if monitor_iface.is_empty() {
-                return respond_err("collector has no monitor interface configured");
-            }
-            let iface = monitor_iface.to_string();
-            let iface_disp = iface.clone();
+            let ifaces = monitor_ifaces.to_vec();
             let ap = audit_path.clone();
-            let res = tokio::task::spawn_blocking(move || tc_control::clear_root_qdisc(&iface)).await;
+            let res = tokio::task::spawn_blocking(move || tc_netem_clear_all(&ifaces)).await;
             match res {
-                Ok(Ok(())) => {
+                Ok(Ok(data)) => {
                     let _ = control::audit(
                         ap.as_deref(),
                         "tc_netem_clear",
-                        &format!("iface={iface_disp}"),
+                        &format!("data={data}"),
                         Some("success"),
                         sid,
                     );
-                    respond_ok(json!({ "iface": iface_disp, "cleared": true }))
+                    respond_ok(json!({
+                        "iface": data["cleared_ifaces"].get(0).cloned().unwrap_or(json!(null)),
+                        "ifaces": data["ifaces"],
+                        "cleared_ifaces": data["cleared_ifaces"],
+                        "cleared": true,
+                        "partial_errors": data["partial_errors"],
+                    }))
                 }
                 Ok(Err(e)) => {
                     let _ = control::audit(
                         audit_path.as_deref(),
                         "tc_netem_clear",
-                        &format!("iface={iface_disp} err={e:#}"),
+                        &format!("err={e}"),
                         Some("failure"),
                         sid,
                     );
-                    respond_err(e.to_string())
+                    respond_err(e)
                 }
                 Err(e) => respond_err(e.to_string()),
             }
@@ -1198,7 +1246,7 @@ async fn handle_conn(
     state_dir: PathBuf,
     audit_path: Option<PathBuf>,
     session_id: String,
-    monitor_iface: String,
+    monitor_ifaces: Arc<Vec<String>>,
     netem_host_confirm: bool,
 ) {
     let (read_half, mut write_half) = stream.into_split();
@@ -1221,7 +1269,7 @@ async fn handle_conn(
                     &state_dir,
                     &audit_path,
                     session_id.as_str(),
-                    monitor_iface.as_str(),
+                    monitor_ifaces.as_ref().as_slice(),
                     netem_host_confirm,
                 )
                 .await;
@@ -1245,7 +1293,7 @@ pub async fn serve_control_socket(
     state_dir: PathBuf,
     audit_path: Option<PathBuf>,
     session_id: String,
-    monitor_iface: String,
+    monitor_ifaces: Arc<Vec<String>>,
     netem_host_confirm: bool,
 ) {
     let _ = tokio::fs::remove_file(&path).await;
@@ -1267,10 +1315,10 @@ pub async fn serve_control_socket(
                 let sd = state_dir.clone();
                 let ap = audit_path.clone();
                 let sid = session_id.clone();
-                let iface = monitor_iface.clone();
+                let ifaces = monitor_ifaces.clone();
                 let nhc = netem_host_confirm;
                 tokio::spawn(async move {
-                    handle_conn(stream, r, sc, ac, sd, ap, sid, iface, nhc).await;
+                    handle_conn(stream, r, sc, ac, sd, ap, sid, ifaces, nhc).await;
                 });
             }
             Err(e) => log::warn!("control accept: {e}"),

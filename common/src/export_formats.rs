@@ -283,9 +283,11 @@ mod tests {
             schema_version: 2,
             ts_unix_ms: 42,
             iface: "eth0".into(),
+            monitored_ifaces: vec!["eth0".into()],
             rx: DirectionTotals { packets: 0, bytes: 0 },
             tx: DirectionTotals { packets: 0, bytes: 0 },
             health: HealthSnapshot::default(),
+            flow_protocol_totals: Default::default(),
             flows_rx: vec![FlowRow {
                 src_ip: "10.0.0.1".into(),
                 dst_ip: "8.8.8.8".into(),
@@ -363,6 +365,7 @@ mod tests {
         let mut snap = snapshot();
         snap.ts_unix_ms = 99;
         snap.iface = "wlan0".into();
+        snap.monitored_ifaces = vec!["wlan0".into()];
         snap.flows_rx[0].src_ip = "10.0.0.2".into();
         snap.aggregates_by_pid[0].pid = 2;
         snap.aggregates_by_pid[0].comm = Some("wget".into());
