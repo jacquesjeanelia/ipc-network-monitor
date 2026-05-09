@@ -1,5 +1,6 @@
 //! optional `ss`(8) parse pass: fills `local_pid` when `/proc` inode correlation missed a row
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,6 +114,21 @@ fn parse_ss_line(line: &str) -> Option<SsRow> {
     })
 }
 
+/// Canonical TCP 4-tuple key (order-independent). Uses `\x1f` so IPv6 `:` does not collide.
+fn tcp_norm_key(sip: &str, sp: u16, dip: &str, dp: u16) -> String {
+    let a = (sip, sp);
+    let b = (dip, dp);
+    match a.cmp(&b) {
+        std::cmp::Ordering::Greater => format!("6\x1f{dip}\x1f{dp}\x1f{sip}\x1f{sp}"),
+        _ => format!("6\x1f{sip}\x1f{sp}\x1f{dip}\x1f{dp}"),
+    }
+}
+
+fn udp_local_key(ip: &str, port: u16) -> String {
+    format!("17\x1f{ip}\x1f{port}")
+}
+
+#[cfg(test)]
 fn flow_matches_ss(row: &FlowRow, ss: &SsRow) -> bool {
     let want = match row.protocol.as_str() {
         "TCP" => 6u8,
@@ -238,18 +254,56 @@ pub fn enrich_flows_from_ss(
         return;
     }
 
+    let mut tcp_pid: HashMap<String, u32> = HashMap::new();
+    let mut udp_pid: HashMap<String, u32> = HashMap::new();
+    for ss in &ss_rows {
+        let Some(pid) = ss.pid else {
+            continue;
+        };
+        match ss.proto {
+            6 => {
+                let k = tcp_norm_key(
+                    &ss.local_ip,
+                    ss.local_port,
+                    &ss.remote_ip,
+                    ss.remote_port,
+                );
+                tcp_pid.entry(k).or_insert(pid);
+            }
+            17 => {
+                let k = udp_local_key(&ss.local_ip, ss.local_port);
+                udp_pid.entry(k).or_insert(pid);
+            }
+            _ => {}
+        }
+    }
+
     for row in flows_rx.iter_mut().chain(flows_tx.iter_mut()) {
         if row.local_pid.is_some() {
             continue;
         }
-        for ss in &ss_rows {
-            if !flow_matches_ss(row, ss) {
-                continue;
+        match row.protocol.as_str() {
+            "TCP" => {
+                let k = tcp_norm_key(
+                    &row.src_ip,
+                    row.src_port,
+                    &row.dst_ip,
+                    row.dst_port,
+                );
+                if let Some(&p) = tcp_pid.get(&k) {
+                    row.local_pid = Some(p);
+                }
             }
-            if let Some(pid) = ss.pid {
-                row.local_pid = Some(pid);
-                break;
+            "UDP" => {
+                if let Some(&p) = udp_pid.get(&udp_local_key(&row.src_ip, row.src_port)) {
+                    row.local_pid = Some(p);
+                    continue;
+                }
+                if let Some(&p) = udp_pid.get(&udp_local_key(&row.dst_ip, row.dst_port)) {
+                    row.local_pid = Some(p);
+                }
             }
+            _ => {}
         }
     }
 }

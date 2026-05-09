@@ -760,7 +760,8 @@ async fn main() -> anyhow::Result<()> {
     );
     if eff.proc_pid_correlation {
         println!(
-            "PID: /proc/net/tcp+udp inode + /proc/*/fd scan each tick; ss(8) cross-check when any flow lacks pid"
+            "PID: /proc/net/tcp+udp inode + /proc/*/fd scan each tick; ss(8) for missing PIDs: min interval {} ms (--ss-autofill-min-interval-ms; 0 = every tick); --ss-enrich runs ss every tick",
+            eff.ss_autofill_min_interval_ms,
         );
         if let Some(ns) = eff.ss_netns.as_ref() {
             println!(
@@ -800,6 +801,7 @@ async fn main() -> anyhow::Result<()> {
     let mut prev_nic_stats: Vec<NicStatRow> = Vec::new();
     let mut prev_tcp_handshake: Option<TcpHandshakeSignals> = None;
     let mut prev_ip_frag: Option<IpFragSignals> = None;
+    let mut last_ss_autofill: Option<std::time::Instant> = None;
 
     loop {
         let tick_start = std::time::Instant::now();
@@ -872,12 +874,20 @@ async fn main() -> anyhow::Result<()> {
             .chain(flows_tx_full.iter())
             .any(|row| row.local_pid.is_none());
         let mut ss_enrich_ms = 0u64;
-        if eff.ss_enrich || have_any_missing_pid {
+        let throttle_ok = eff.ss_autofill_min_interval_ms == 0
+            || last_ss_autofill
+                .map(|t| t.elapsed().as_millis() as u64 >= eff.ss_autofill_min_interval_ms)
+                .unwrap_or(true);
+        let run_ss = eff.ss_enrich || (have_any_missing_pid && throttle_ok);
+        if run_ss {
             let t0 = std::time::Instant::now();
             ss_enrich::enrich_flows_from_ss(&mut flows_rx_full, &mut flows_tx_full, eff.ss_netns.as_deref());
             ss_enrich_ms = t0.elapsed().as_millis() as u64;
             attr::enrich_flow_rows(&mut flows_rx_full);
             attr::enrich_flow_rows(&mut flows_tx_full);
+            if !eff.ss_enrich {
+                last_ss_autofill = Some(std::time::Instant::now());
+            }
         }
 
         attr::finalize_attribution(&mut flows_rx_full, eff.ss_netns.as_deref());
