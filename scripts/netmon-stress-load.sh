@@ -9,6 +9,12 @@
 #   NETMON_STRESS_SECONDS=300 NETMON_TCP_WORKERS=16 ./scripts/netmon-stress-load.sh
 #   NETMON_HTTPS_URL=https://internal.example/health  NETMON_TCP_HOSTS="10.0.0.1 10.0.0.2" ./scripts/netmon-stress-load.sh
 #   NETMON_CURL_QUIET=0  # show curl errors while debugging
+#   NETMON_SKIP_CONNTRACK_LOAD=1 — do not try modprobe nf_conntrack when sysctls are missing
+#   NETMON_STATS=1 (default) — log RSS + Σ%CPU for ipc-network-monitor processes (see NETMON_MONITOR_PROCS)
+#   NETMON_STATS=0 — disable those lines
+#   NETMON_STATS_INTERVAL=10 — seconds between samples
+#   NETMON_MONITOR_PROCS="kernel-spy netmon-desktop collector" — exact comm names for pgrep -x (space-separated).
+#     Add e.g. `ui` if you run the native UI binary and comm is unique on the host.
 #
 # Optional real apps (better for PID/comm + inode correlation in kernel-spy):
 #   NETMON_APPS=1 (default) — start git / python3 / iperf3 / aria2c / socat / hey|ab when installed
@@ -37,6 +43,9 @@ NETMON_APPS="${NETMON_APPS:-1}"
 NETMON_IPERF_PORT="${NETMON_IPERF_PORT:-5201}"
 NETMON_IPERF_HOSTS="${NETMON_IPERF_HOSTS:-bouygues.iperf.fr ping.online.net}"
 NETMON_GIT_URL="${NETMON_GIT_URL:-https://github.com/octocat/Hello-World.git}"
+NETMON_STATS="${NETMON_STATS:-1}"
+NETMON_STATS_INTERVAL="${NETMON_STATS_INTERVAL:-10}"
+NETMON_MONITOR_PROCS="${NETMON_MONITOR_PROCS:-kernel-spy netmon-desktop collector}"
 
 PIDS=()
 cleanup() {
@@ -50,6 +59,82 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Load nf_conntrack so /proc/sys/net/netfilter/nf_conntrack_{count,max} exist (dashboard conntrack cards).
+# Traffic alone does not create those files if the module was never loaded.
+ensure_nf_conntrack() {
+  [[ "${NETMON_SKIP_CONNTRACK_LOAD:-0}" == "1" ]] && return 0
+  if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    echo "[netmon-stress] nf_conntrack sysctls present."
+    return 0
+  fi
+  echo "[netmon-stress] nf_conntrack sysctls missing — trying to load module…"
+  if [[ "${EUID:-0}" -eq 0 ]]; then
+    modprobe nf_conntrack 2>/dev/null || true
+  else
+    if have sudo; then
+      sudo -n modprobe nf_conntrack 2>/dev/null || true
+    fi
+    modprobe nf_conntrack 2>/dev/null || true
+  fi
+  if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    echo "[netmon-stress] nf_conntrack active; conntrack gauges should populate after the next kernel-spy tick."
+    return 0
+  fi
+  echo "[netmon-stress] warn: nf_conntrack still unavailable (run as root: sudo modprobe nf_conntrack, or enable a stateful firewall/NAT). Conntrack UI may stay n/a."
+}
+
+# Sum RSS (KiB) and Σ%CPU for a comma-separated PID list (one ps invocation).
+sum_ps_rss_cpu() {
+  local csv="$1"
+  [[ -z "$csv" ]] && echo "0 0" && return 0
+  LC_ALL=C ps --no-headers -o rss=,%cpu= -p "$csv" 2>/dev/null | awk '{r+=$1+0; c+=$2+0} END{printf "%d %.2f", r, c}'
+}
+
+# PIDs for all configured netmon-related binaries (union, deduped).
+netmon_union_pids() {
+  local name
+  for name in ${NETMON_MONITOR_PROCS}; do
+    [[ -z "$name" ]] && continue
+    pgrep -x "$name" 2>/dev/null
+  done | sort -un
+}
+
+start_netmon_resource_monitor() {
+  [[ "${NETMON_STATS}" != "1" ]] && return 0
+  local interval="${NETMON_STATS_INTERVAL}"
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=10
+  ((interval < 2)) && interval=2
+  echo "[netmon-stress] sampling netmon CPU/RSS every ${interval}s — procs: ${NETMON_MONITOR_PROCS} (NETMON_STATS=0 to disable)"
+  (
+    export LC_ALL=C
+    while :; do
+      sleep "$interval"
+      mapfile -t allp < <(netmon_union_pids)
+      local union_csv="" tr=0 tc=0.0
+      if ((${#allp[@]} > 0)); then
+        union_csv=$(IFS=, ; echo "${allp[*]}")
+        read -r tr tc < <(sum_ps_rss_cpu "${union_csv}")
+      fi
+      local detail="" name
+      for name in ${NETMON_MONITOR_PROCS}; do
+        [[ -z "$name" ]] && continue
+        mapfile -t one < <(pgrep -x "$name" 2>/dev/null || true)
+        if ((${#one[@]} == 0)); then
+          detail+=" ${name}:—"
+          continue
+        fi
+        local ocsv br bc
+        ocsv=$(IFS=, ; echo "${one[*]}")
+        read -r br bc < <(sum_ps_rss_cpu "${ocsv}")
+        detail+=$(printf ' %s:%.1fMiB/%.0f%%' "$name" "$(awk -v x="$br" 'BEGIN{printf "%.1f", x/1024}')" "$bc")
+      done
+      printf '[netmon-stress] netmon | Σ RSS≈%.1f MiB ΣCPU≈%.1f%% |%s\n' \
+        "$(awk -v x="${tr:-0}" 'BEGIN{printf "%.1f", x/1024}')" "${tc:-0}" "$detail"
+    done
+  ) &
+  PIDS+=($!)
+}
 
 curl_quiet() {
   if [[ "${NETMON_CURL_QUIET}" == "1" ]]; then
@@ -310,6 +395,8 @@ echo "[netmon-stress] HTTPS URL: ${NETMON_HTTPS_URL}"
 echo "[netmon-stress] ensure kernel-spy is bound to the iface that carries this default-route traffic."
 echo "[netmon-stress] tip: curl timeouts to 1.1.1.1 usually mean outbound HTTPS is blocked or there is no working default route — try NETMON_HTTPS_URL=https://<reachable-host>/path or reduce NETMON_TCP_WORKERS / NETMON_HTTPS_BURST."
 
+ensure_nf_conntrack
+
 for i in $(seq 1 "${NETMON_TCP_WORKERS}"); do
   tcp_syn_and_tls_worker "$i" &
   PIDS+=($!)
@@ -335,6 +422,8 @@ PIDS+=($!)
 if [[ "${NETMON_APPS}" == "1" ]]; then
   start_app_generators
 fi
+
+start_netmon_resource_monitor
 
 echo "[netmon-stress] all workers running. Ctrl+C to stop."
 wait

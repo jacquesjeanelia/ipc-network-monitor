@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# Best-effort: expose nf_conntrack sysctls so monitors can read conntrack count/max (optional).
+if [[ ! -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+  if [[ "${EUID:-0}" -eq 0 ]]; then
+    modprobe nf_conntrack 2>/dev/null || true
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo modprobe nf_conntrack 2>/dev/null || true
+  fi
+fi
+
 echo "Starting long-lived multi-protocol traffic..."
 
 # ICMP
