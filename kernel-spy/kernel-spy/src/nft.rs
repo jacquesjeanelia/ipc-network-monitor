@@ -3,7 +3,7 @@
 //! ebpf `BLOCKLIST_MAP` stays the fast path for ipv4 drops here; nft is an auditable side channel.
 //! do not configure the same drop in both places (double-drop risk).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -62,6 +62,131 @@ pub fn ensure_table() -> anyhow::Result<()> {
 }
 
 /// human-readable nft one-liner before applying a drop rule
+/// Parsed user rules from [`list_table_text`] output (best-effort; ignores hook / policy lines).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedOutputRule {
+    Ipv4DaddrDrop(Ipv4Addr),
+    Ipv4DaddrAccept(Ipv4Addr),
+    Ipv4DaddrRateDrop {
+        addr: Ipv4Addr,
+        rate_summary: String,
+    },
+    Ipv6DaddrDrop(Ipv6Addr),
+    Ipv6DaddrAccept(Ipv6Addr),
+    Ipv6DaddrRateDrop {
+        addr: Ipv6Addr,
+        rate_summary: String,
+    },
+    SkuidDrop(u32),
+    SkgidDrop(u32),
+}
+
+impl ParsedOutputRule {
+    pub fn policy_id(&self) -> String {
+        match self {
+            ParsedOutputRule::Ipv4DaddrDrop(a) => format!("nft:output:ip_daddr:{a}:drop"),
+            ParsedOutputRule::Ipv4DaddrAccept(a) => format!("nft:output:ip_daddr:{a}:accept"),
+            ParsedOutputRule::Ipv4DaddrRateDrop { addr, rate_summary } => {
+                format!("nft:output:ip_daddr:{addr}:rate:{rate_summary}:drop")
+            }
+            ParsedOutputRule::Ipv6DaddrDrop(a) => format!("nft:output:ip6_daddr:{a}:drop"),
+            ParsedOutputRule::Ipv6DaddrAccept(a) => format!("nft:output:ip6_daddr:{a}:accept"),
+            ParsedOutputRule::Ipv6DaddrRateDrop { addr, rate_summary } => {
+                format!("nft:output:ip6_daddr:{addr}:rate:{rate_summary}:drop")
+            }
+            ParsedOutputRule::SkuidDrop(u) => format!("nft:output:skuid:{u}:drop"),
+            ParsedOutputRule::SkgidDrop(g) => format!("nft:output:skgid:{g}:drop"),
+        }
+    }
+}
+
+/// Same `policy_id` string [`ParsedOutputRule`] uses for an IPv4 rate-limited drop (whitespace-normalized rate).
+pub fn policy_id_ipv4_rate_drop(addr: Ipv4Addr, rate: &str) -> String {
+    let rate_summary = rate.split_whitespace().collect::<Vec<_>>().join(" ");
+    ParsedOutputRule::Ipv4DaddrRateDrop {
+        addr,
+        rate_summary,
+    }
+    .policy_id()
+}
+
+fn try_parse_output_rule_line(line: &str) -> Option<ParsedOutputRule> {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') {
+        return None;
+    }
+    let tokens: Vec<&str> = t.split_whitespace().collect();
+    if tokens.len() >= 4 && tokens[0] == "ip" && tokens[1] == "daddr" {
+        let addr: Ipv4Addr = tokens[2].parse().ok()?;
+        if tokens.windows(2).any(|w| w[0] == "limit" && w[1] == "rate") {
+            let rate_summary = extract_rate_after_limit(&tokens)?;
+            if tokens.contains(&"drop") {
+                return Some(ParsedOutputRule::Ipv4DaddrRateDrop { addr, rate_summary });
+            }
+            return None;
+        }
+        if tokens.contains(&"accept") {
+            return Some(ParsedOutputRule::Ipv4DaddrAccept(addr));
+        }
+        if tokens.contains(&"drop") {
+            return Some(ParsedOutputRule::Ipv4DaddrDrop(addr));
+        }
+        return None;
+    }
+    if tokens.len() >= 4 && tokens[0] == "ip6" && tokens[1] == "daddr" {
+        let addr: Ipv6Addr = tokens[2].parse().ok()?;
+        if tokens.windows(2).any(|w| w[0] == "limit" && w[1] == "rate") {
+            let rate_summary = extract_rate_after_limit(&tokens)?;
+            if tokens.contains(&"drop") {
+                return Some(ParsedOutputRule::Ipv6DaddrRateDrop { addr, rate_summary });
+            }
+            return None;
+        }
+        if tokens.contains(&"accept") {
+            return Some(ParsedOutputRule::Ipv6DaddrAccept(addr));
+        }
+        if tokens.contains(&"drop") {
+            return Some(ParsedOutputRule::Ipv6DaddrDrop(addr));
+        }
+        return None;
+    }
+    if tokens.len() >= 4 && tokens[0] == "meta" && tokens[1] == "skuid" {
+        let uid: u32 = tokens[2].parse().ok()?;
+        if tokens.contains(&"drop") {
+            return Some(ParsedOutputRule::SkuidDrop(uid));
+        }
+        return None;
+    }
+    if tokens.len() >= 4 && tokens[0] == "meta" && tokens[1] == "skgid" {
+        let gid: u32 = tokens[2].parse().ok()?;
+        if tokens.contains(&"drop") {
+            return Some(ParsedOutputRule::SkgidDrop(gid));
+        }
+        return None;
+    }
+    None
+}
+
+fn extract_rate_after_limit(tokens: &[&str]) -> Option<String> {
+    let i = tokens.iter().position(|t| *t == "rate")?;
+    let j = tokens.iter().position(|t| *t == "drop")?;
+    if j > i + 1 {
+        return Some(tokens[i + 1..j].join(" "));
+    }
+    None
+}
+
+/// Scan every line of `nft list table inet ipc_netmon` output for recognizable rule clauses.
+pub fn parse_ipc_netmon_output_rules(table_text: &str) -> Vec<ParsedOutputRule> {
+    let mut out = Vec::new();
+    for line in table_text.lines() {
+        if let Some(r) = try_parse_output_rule_line(line) {
+            out.push(r);
+        }
+    }
+    out
+}
+
 pub fn preview_drop_ipv4(dst: Ipv4Addr) -> String {
     format!(
         "nft add rule {} {} {} ip daddr {} drop",
@@ -105,7 +230,7 @@ fn backup_path(state_dir: &Path) -> PathBuf {
     state_dir.join("nft_ruleset_backup.nft")
 }
 
-fn list_table_text() -> anyhow::Result<String> {
+pub(crate) fn list_table_text() -> anyhow::Result<String> {
     let out = nft_cmd()
         .args(["list", "table", TABLE_FAMILY, TABLE_NAME])
         .output()
@@ -330,6 +455,46 @@ pub fn apply_rate_limit_ipv4(state_dir: &Path, dst: Ipv4Addr, rate: &str) -> any
     Ok(backup)
 }
 
+/// preview early-accept for IPv4 daddr on the output hook (allow / bypass later rules in this chain)
+pub fn preview_accept_ipv4(dst: Ipv4Addr) -> String {
+    format!(
+        "nft add rule {} {} {} ip daddr {} accept",
+        TABLE_FAMILY, TABLE_NAME, CHAIN_OUT, dst
+    )
+}
+
+/// apply ipv4 daddr accept on local output — same backup / dry-run / verify pattern as drop
+pub fn apply_accept_ipv4(state_dir: &Path, dst: Ipv4Addr) -> anyhow::Result<PathBuf> {
+    ensure_table()?;
+    let backup = backup_table(state_dir)?;
+    let dst_s = dst.to_string();
+    let rule_args = [
+        TABLE_FAMILY,
+        TABLE_NAME,
+        CHAIN_OUT,
+        "ip",
+        "daddr",
+        dst_s.as_str(),
+        "accept",
+    ];
+    dry_run_add_rule(&rule_args)?;
+    let st = nft_cmd()
+        .arg("add")
+        .arg("rule")
+        .args(&rule_args)
+        .status()
+        .context("nft add accept rule")?;
+    if !st.success() {
+        restore_backup_if_needed(&backup);
+        anyhow::bail!("nft add accept rule failed (exit {:?})", st.code());
+    }
+    if let Err(e) = verify_rule_contains(&format!("ip daddr {} accept", dst_s)) {
+        restore_backup_if_needed(&backup);
+        anyhow::bail!("nft accept verification failed: {e:#}");
+    }
+    Ok(backup)
+}
+
 /// load ruleset from a file written by [`backup_table`] (`nft -f`)
 pub fn rollback_from_file(backup: &Path) -> anyhow::Result<()> {
     if !backup.exists() {
@@ -358,6 +523,19 @@ pub fn flush_output_chain() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    fn policy_id_ipv4_rate_drop_matches_parsed_rule() {
+        let addr: Ipv4Addr = "198.51.100.2".parse().unwrap();
+        let id_apply = policy_id_ipv4_rate_drop(addr, "1  mbyte/second");
+        let id_parsed = ParsedOutputRule::Ipv4DaddrRateDrop {
+            addr,
+            rate_summary: "1 mbyte/second".into(),
+        }
+        .policy_id();
+        assert_eq!(id_apply, id_parsed);
+    }
 
     #[test]
     fn validate_rate_accepts_common_forms() {
@@ -390,5 +568,42 @@ mod tests {
         let p = preview_drop_gid(1001);
         assert!(p.contains("meta skgid 1001"));
         assert!(p.contains("drop"));
+    }
+
+    #[test]
+    fn parse_output_rules_from_list_sample() {
+        let text = r#"table inet ipc_netmon {
+	chain output {
+		type filter hook output priority filter; policy accept;
+		ip daddr 203.0.113.17 drop
+		ip daddr 198.51.100.10 limit rate 1 mbytes/second drop
+		ip daddr 192.0.2.5 accept
+		ip6 daddr 2001:db8::1 drop
+		ip6 daddr 2001:db8::2 limit rate 512 kbytes/second drop
+		ip6 daddr 2001:db8::3 accept
+		meta skuid 1000 drop
+	}
+}"#;
+        let rules = parse_ipc_netmon_output_rules(text);
+        let d1: Ipv4Addr = "203.0.113.17".parse().unwrap();
+        let d2: Ipv4Addr = "198.51.100.10".parse().unwrap();
+        let d3: Ipv4Addr = "192.0.2.5".parse().unwrap();
+        let v1: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let v2: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let v3: Ipv6Addr = "2001:db8::3".parse().unwrap();
+        assert!(rules.iter().any(|r| matches!(r, ParsedOutputRule::Ipv4DaddrDrop(a) if *a == d1)));
+        assert!(rules.iter().any(|r| matches!(r, ParsedOutputRule::Ipv4DaddrRateDrop { addr, .. } if *addr == d2)));
+        assert!(rules.iter().any(|r| matches!(r, ParsedOutputRule::Ipv4DaddrAccept(a) if *a == d3)));
+        assert!(rules.iter().any(|r| matches!(r, ParsedOutputRule::Ipv6DaddrDrop(a) if *a == v1)));
+        assert!(rules.iter().any(|r| matches!(r, ParsedOutputRule::Ipv6DaddrRateDrop { addr, .. } if *addr == v2)));
+        assert!(rules.iter().any(|r| matches!(r, ParsedOutputRule::Ipv6DaddrAccept(a) if *a == v3)));
+        assert!(rules.iter().any(|r| matches!(r, ParsedOutputRule::SkuidDrop(1000))));
+    }
+
+    #[test]
+    fn preview_accept_contains_accept() {
+        let p = preview_accept_ipv4("8.8.4.4".parse().unwrap());
+        assert!(p.contains("accept"));
+        assert!(p.contains("8.8.4.4"));
     }
 }

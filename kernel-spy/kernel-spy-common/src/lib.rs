@@ -99,18 +99,29 @@ impl HealthCounterIndex {
     }
 }
 
-/// pid + process name in SOCK_SPORT_PID, keyed by local TCP sport at ESTABLISHED (host byte order)
+/// pid, real uid/gid, and comm in `SOCK_SPORT_PID`, keyed by local TCP sport (host byte order).
+/// eBPF fills this on `sock:inet_sock_set_state` for early TCP states so short-lived tasks are
+/// captured before a `/proc` scan. UID/GID are from `bpf_get_current_uid_gid` at that instant;
+/// userspace still prefers `/proc/<pid>/status` when the task still exists (setuid, namespaces).
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct PidComm {
     pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
     _pad: u32,
     pub comm: [u8; 16],
 }
 
 impl PidComm {
-    pub const fn new(pid: u32, comm: [u8; 16]) -> Self {
-        Self { pid, _pad: 0, comm }
+    pub const fn new(pid: u32, uid: u32, gid: u32, comm: [u8; 16]) -> Self {
+        Self {
+            pid,
+            uid,
+            gid,
+            _pad: 0,
+            comm,
+        }
     }
 }
 

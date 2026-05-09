@@ -4,8 +4,10 @@ mod attr;
 mod config;
 mod control;
 mod control_rpc;
+mod kernel_stats;
 mod netdev;
 mod nft;
+mod policy_impact;
 mod proc_corr;
 mod session_history;
 mod socket_perm;
@@ -24,8 +26,10 @@ use aya::programs::{
 };
 use clap::Parser;
 use common::{
-    DirectionTotals, ExportLine, FlowRow, HealthSnapshot, MonitorSnapshotV1, ProbeStatus,
-    SCHEMA_VERSION, SessionInfo,
+    CollectorCacheMeta, CollectorTickMetrics, ConntrackSignalsDelta,
+    DirectionTotals, EbpfFlowMapStats, ExportLine, FlowRow, HealthSnapshot, IpFragSignals,
+    MonitorSnapshotV1, NicStatRow, ProbeStatus, SCHEMA_VERSION, SessionInfo, SoftnetSignals,
+    TcpHandshakeSignals, TcpKernelSignals,
 };
 use kernel_spy_common::{HealthCounterIndex, PacketMetadata, PacketMetadataV6};
 use log::{debug, warn};
@@ -60,6 +64,55 @@ fn xdp_attach_order(mode: &str) -> anyhow::Result<Vec<(&'static str, XdpFlags)>>
         .into_iter()
         .map(|name| Ok((name, xdp_flags_from_str(name)?)))
         .collect()
+}
+
+#[inline]
+fn new_flow_row(
+    src_ip: String,
+    dst_ip: String,
+    src_port: u16,
+    dst_port: u16,
+    protocol: String,
+    bytes: u64,
+    local_pid: Option<u32>,
+) -> FlowRow {
+    FlowRow {
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        protocol,
+        bytes,
+        local_pid,
+        local_uid: None,
+        local_gid: None,
+        local_username: None,
+        local_comm: None,
+        attribution_confidence: String::new(),
+        attribution_reasons: vec![],
+        attribution_path: String::new(),
+        netns: None,
+        cgroup: None,
+        container_hint: None,
+    }
+}
+
+/// Share of TCP/UDP flow rows that have a resolved local PID (best-effort).
+fn socket_attribution_coverage(rows_rx: &[FlowRow], rows_tx: &[FlowRow]) -> f64 {
+    let socket_rows: usize = rows_rx
+        .iter()
+        .chain(rows_tx)
+        .filter(|r| matches!(r.protocol.as_str(), "TCP" | "UDP"))
+        .count();
+    if socket_rows == 0 {
+        return 100.0;
+    }
+    let with_pid = rows_rx
+        .iter()
+        .chain(rows_tx)
+        .filter(|r| matches!(r.protocol.as_str(), "TCP" | "UDP") && r.local_pid.is_some())
+        .count();
+    (with_pid as f64 / socket_rows as f64) * 100.0
 }
 
 fn protocol_name(p: u8) -> &'static str {
@@ -116,18 +169,15 @@ fn collect_flow_rows<T: Borrow<MapData>>(
         };
         let src = Ipv4Addr::from(meta.src_ip.to_be_bytes());
         let dst = Ipv4Addr::from(meta.dst_ip.to_be_bytes());
-        out.push(FlowRow {
-            src_ip: src.to_string(),
-            dst_ip: dst.to_string(),
-            src_port: meta.src_port,
-            dst_port: meta.dst_port,
-            protocol: protocol_name(meta.protocol).to_string(),
+        out.push(new_flow_row(
+            src.to_string(),
+            dst.to_string(),
+            meta.src_port,
+            meta.dst_port,
+            protocol_name(meta.protocol).to_string(),
             bytes,
             local_pid,
-            local_uid: None,
-            local_username: None,
-            local_comm: None,
-        });
+        ));
     }
     Ok(out)
 }
@@ -150,18 +200,15 @@ fn collect_flow_rows_v6<T: Borrow<MapData>>(
         };
         let src = Ipv6Addr::from(meta.src_ip);
         let dst = Ipv6Addr::from(meta.dst_ip);
-        out.push(FlowRow {
-            src_ip: src.to_string(),
-            dst_ip: dst.to_string(),
-            src_port: meta.src_port,
-            dst_port: meta.dst_port,
-            protocol: protocol_name(meta.protocol).to_string(),
+        out.push(new_flow_row(
+            src.to_string(),
+            dst.to_string(),
+            meta.src_port,
+            meta.dst_port,
+            protocol_name(meta.protocol).to_string(),
             bytes,
             local_pid,
-            local_uid: None,
-            local_username: None,
-            local_comm: None,
-        });
+        ));
     }
     Ok(out)
 }
@@ -498,14 +545,56 @@ async fn main() -> anyhow::Result<()> {
         eff.session_ring_size,
     )));
 
+    let sim_cfg = Arc::new(Mutex::new(
+        control_rpc::load_thresholds_from_state_dir(&eff.state_dir).unwrap_or_else(|| {
+            control_rpc::SimulationRiskThresholds {
+                medium_bytes: eff.policy_sim_medium_bytes,
+                high_bytes: eff.policy_sim_high_bytes,
+                medium_uncertain_ratio: eff.policy_sim_medium_uncertain_ratio,
+                high_uncertain_ratio: eff.policy_sim_high_uncertain_ratio,
+            }
+        }),
+    ));
+    let alert_rpc_cfg = Arc::new(Mutex::new(
+        control_rpc::load_alert_thresholds_from_state_dir(&eff.state_dir).unwrap_or_else(|| {
+            control_rpc::AlertThresholds {
+                softnet_warn_per_tick: eff.alert_softnet_dropped_warn_per_tick,
+                softnet_crit_per_tick: eff.alert_softnet_dropped_crit_per_tick,
+                listen_warn_per_tick: eff.alert_listen_overflows_warn_per_tick,
+                listen_crit_per_tick: eff.alert_listen_overflows_crit_per_tick,
+                conntrack_util_warn_percent: eff.alert_conntrack_util_warn_percent,
+                conntrack_util_crit_percent: eff.alert_conntrack_util_crit_percent,
+                conntrack_insert_failed_warn_per_tick: eff.alert_conntrack_insert_failed_warn_per_tick,
+                conntrack_insert_failed_crit_per_tick: eff.alert_conntrack_insert_failed_crit_per_tick,
+                nic_rx_dropped_warn_per_tick: eff.alert_nic_rx_dropped_warn_per_tick,
+                nic_rx_dropped_crit_per_tick: eff.alert_nic_rx_dropped_crit_per_tick,
+            }
+        }),
+    ));
+
     if !eff.no_control_socket {
         let ctl_path = eff.control_socket.clone();
         let ring_ctl = session_ring.clone();
         let state_dir = eff.state_dir.clone();
         let audit_ctl = audit_path.clone();
         let sid = session_id.clone();
+        let sim_for_ctl = sim_cfg.clone();
+        let alert_for_ctl = alert_rpc_cfg.clone();
+        let monitor_iface = iface.clone();
+        let netem_confirm = eff.netem_confirm;
         tokio::task::spawn(async move {
-            control_rpc::serve_control_socket(ctl_path, ring_ctl, state_dir, audit_ctl, sid).await;
+            control_rpc::serve_control_socket(
+                ctl_path,
+                ring_ctl,
+                sim_for_ctl,
+                alert_for_ctl,
+                state_dir,
+                audit_ctl,
+                sid,
+                monitor_iface,
+                netem_confirm,
+            )
+            .await;
         });
     }
 
@@ -556,6 +645,16 @@ async fn main() -> anyhow::Result<()> {
         rx_ema_alpha: eff.alert_rx_ema_alpha,
         rx_ema_delta_threshold: eff.alert_rx_ema_delta_threshold,
         top_pid_bytes_threshold: eff.alert_top_pid_bytes,
+        softnet_dropped_warn_per_tick: eff.alert_softnet_dropped_warn_per_tick,
+        softnet_dropped_crit_per_tick: eff.alert_softnet_dropped_crit_per_tick,
+        listen_overflows_warn_per_tick: eff.alert_listen_overflows_warn_per_tick,
+        listen_overflows_crit_per_tick: eff.alert_listen_overflows_crit_per_tick,
+        conntrack_util_warn_percent: eff.alert_conntrack_util_warn_percent,
+        conntrack_util_crit_percent: eff.alert_conntrack_util_crit_percent,
+        conntrack_insert_failed_warn_per_tick: eff.alert_conntrack_insert_failed_warn_per_tick,
+        conntrack_insert_failed_crit_per_tick: eff.alert_conntrack_insert_failed_crit_per_tick,
+        nic_rx_dropped_warn_per_tick: eff.alert_nic_rx_dropped_warn_per_tick,
+        nic_rx_dropped_crit_per_tick: eff.alert_nic_rx_dropped_crit_per_tick,
     });
 
     let lines = cli.console_flow_lines.max(1);
@@ -629,7 +728,15 @@ async fn main() -> anyhow::Result<()> {
     // Initialize aggregate history (keep last 100 snapshots)
     let mut aggregate_history = aggregate::AggregateHistory::new(100);
 
+    let mut prev_tcp_kernel: Option<TcpKernelSignals> = None;
+    let mut prev_softnet: Option<SoftnetSignals> = None;
+    let mut prev_conntrack_counters: Option<ConntrackSignalsDelta> = None;
+    let mut prev_nic_stats: Vec<NicStatRow> = Vec::new();
+    let mut prev_tcp_handshake: Option<TcpHandshakeSignals> = None;
+    let mut prev_ip_frag: Option<IpFragSignals> = None;
+
     loop {
+        let tick_start = std::time::Instant::now();
         let rx_totals = read_direction_totals(&monitor_rx);
         let tx_totals = read_direction_totals(&monitor_tx);
         let (tcp_retrans, policy_drops) = read_health(&health);
@@ -660,8 +767,8 @@ async fn main() -> anyhow::Result<()> {
         attr::enrich_flow_rows(&mut flows_tx);
 
         // Enrich flows missing pid attribution from the eBPF sport→pid map (catches short-lived processes).
-        // Map keys are the local TCP sport at ESTABLISHED; RX packets often have the local ephemeral in
-        // `dst_port` (remote:443 → local:ephemeral), so try both ports for TCP/UDP.
+        // Map keys are the local TCP sport at SYN_SENT / SYN_RECV / ESTABLISHED; RX packets often have the
+        // local ephemeral in `dst_port` (remote:443 → local:ephemeral), so try both ports for TCP/UDP.
         if let Some(ref smap) = sock_sport_pid {
             for row in flows_rx.iter_mut().chain(flows_tx.iter_mut()) {
                 if row.local_pid.is_some() {
@@ -674,9 +781,14 @@ async fn main() -> anyhow::Result<()> {
                     if p == 0 {
                         continue;
                     }
-                    if let Some((pid, comm)) = proc_corr::pid_comm_from_ebpf_map(p, smap) {
+                    if let Some((pid, comm, uid, gid)) = proc_corr::pid_comm_from_ebpf_map(p, smap) {
                         row.local_pid = Some(pid);
                         row.local_comm = Some(comm);
+                        row.local_uid = Some(uid);
+                        row.local_gid = Some(gid);
+                        row.attribution_path = "sport_pid_map".to_string();
+                        row.attribution_reasons.push("sport_pid_map_match".to_string());
+                        row.attribution_confidence = "medium".to_string();
                         break;
                     }
                 }
@@ -695,6 +807,9 @@ async fn main() -> anyhow::Result<()> {
             attr::enrich_flow_rows(&mut flows_tx);
         }
 
+        attr::finalize_attribution(&mut flows_rx, eff.ss_netns.as_deref());
+        attr::finalize_attribution(&mut flows_tx, eff.ss_netns.as_deref());
+
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -709,7 +824,56 @@ async fn main() -> anyhow::Result<()> {
         // Push current aggregates to history
         aggregate_history.push(&aggregates_by_pid, &aggregates_by_user);
 
-        let tick_alerts = alert_engine.evaluate(ts, &rx_totals, &aggregates_by_pid);
+        let tcp_kernel_cur = kernel_stats::read_tcp_kernel_signals();
+        let tcp_kernel_delta =
+            kernel_stats::tcp_kernel_delta(prev_tcp_kernel.as_ref(), &tcp_kernel_cur);
+
+        let softnet_cur = kernel_stats::read_softnet_signals();
+        let softnet_delta = kernel_stats::softnet_delta(prev_softnet.as_ref(), &softnet_cur);
+
+        let conntrack_cur = kernel_stats::read_conntrack_signals();
+        let (conntrack_delta, conntrack_next) =
+            kernel_stats::read_conntrack_delta(prev_conntrack_counters.as_ref());
+
+        let nic_stats_cur = kernel_stats::read_nic_stats(&iface);
+        let nic_stats_delta = kernel_stats::nic_stats_delta(&prev_nic_stats, &nic_stats_cur);
+
+        let tcp_handshake_cur = kernel_stats::read_tcp_handshake_signals();
+        let tcp_handshake_delta =
+            kernel_stats::tcp_handshake_delta(prev_tcp_handshake.as_ref(), &tcp_handshake_cur);
+
+        let ip_frag_cur = kernel_stats::read_ip_frag_signals();
+        let ip_frag_delta = kernel_stats::ip_frag_delta(prev_ip_frag.as_ref(), &ip_frag_cur);
+
+        prev_tcp_kernel = Some(tcp_kernel_cur.clone());
+        prev_softnet = Some(softnet_cur.clone());
+        prev_conntrack_counters = Some(conntrack_next);
+        prev_nic_stats = nic_stats_cur.clone();
+        prev_tcp_handshake = Some(tcp_handshake_cur.clone());
+        prev_ip_frag = Some(ip_frag_cur.clone());
+
+        let tick_alerts = alert_engine.evaluate(
+            ts,
+            &rx_totals,
+            &aggregates_by_pid,
+            &softnet_delta,
+            &tcp_kernel_delta,
+            &conntrack_cur,
+            &conntrack_delta,
+            &nic_stats_delta,
+        );
+
+        let attribution_coverage_percent =
+            socket_attribution_coverage(&flows_rx, &flows_tx);
+        let policy_impact = policy_impact::build_policy_impact(
+            &flows_rx,
+            &flows_tx,
+            &block_ips_v4,
+            &block_ips_v6,
+            &[],
+        );
+
+        let tick_wall_ms = tick_start.elapsed().as_millis() as u64;
 
         let snapshot = MonitorSnapshotV1 {
             schema_version: SCHEMA_VERSION,
@@ -735,6 +899,45 @@ async fn main() -> anyhow::Result<()> {
             aggregate_history_by_pid: aggregate_history.pid_history().to_vec(),
             aggregate_history_by_user: aggregate_history.uid_history().to_vec(),
             alerts: tick_alerts,
+            attribution_coverage_percent,
+            unknown_attribution_buckets: vec![],
+            policy_impact,
+            tcp_kernel: tcp_kernel_cur,
+            softnet: softnet_cur,
+            tcp_kernel_delta,
+            softnet_delta,
+            conntrack: conntrack_cur,
+            conntrack_delta,
+            nic_stats: nic_stats_cur,
+            nic_stats_delta,
+            socket_pressure: kernel_stats::read_socket_pressure(),
+            cgroup_pressure: vec![],
+            drop_reasons: vec![],
+            tcp_handshake: tcp_handshake_cur,
+            tcp_handshake_delta,
+            ip_frag: ip_frag_cur,
+            ip_frag_delta,
+            kernel_snmp: kernel_stats::read_kernel_snmp_tables(),
+            kernel_netstat: kernel_stats::read_kernel_netstat_tables(),
+            sockstat: kernel_stats::read_sockstat_tables(),
+            sockstat6: kernel_stats::read_sockstat6_tables(),
+            socket_table_lines: kernel_stats::read_socket_table_line_counts(),
+            ebpf_flow_maps: EbpfFlowMapStats {
+                v4_rx_entries: count_flow_map_entries(&ip_rx) as u64,
+                v4_tx_entries: count_flow_map_entries(&ip_tx) as u64,
+                v6_rx_entries: count_flow_map_entries_v6(&ip6_rx) as u64,
+                v6_tx_entries: count_flow_map_entries_v6(&ip6_tx) as u64,
+                v4_max_entries: kernel_spy_common::FlowMapCapacity::MAX_ENTRIES_V4_FLOW,
+                v6_max_entries: kernel_spy_common::FlowMapCapacity::MAX_ENTRIES_V6_FLOW,
+            },
+            collector_tick: CollectorTickMetrics {
+                tick_wall_ms,
+                ..Default::default()
+            },
+            collector_cache: CollectorCacheMeta {
+                nft_rules_last_ok_unix_ms: 0,
+                proc_inode_cache_unix_ms: if eff.proc_pid_correlation { ts } else { 0 },
+            },
         };
 
         if let Ok(mut g) = session_ring.lock() {
@@ -866,22 +1069,19 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod flow_merge_tests {
-    use super::merge_flow_rows_by_bytes;
+    use super::{merge_flow_rows_by_bytes, new_flow_row};
     use common::FlowRow;
 
     fn row(bytes: u64, tag: &str) -> FlowRow {
-        FlowRow {
-            src_ip: tag.into(),
-            dst_ip: "0.0.0.0".into(),
-            src_port: 0,
-            dst_port: 0,
-            protocol: "TCP".into(),
+        new_flow_row(
+            tag.into(),
+            "0.0.0.0".into(),
+            0,
+            0,
+            "TCP".into(),
             bytes,
-            local_pid: None,
-            local_uid: None,
-            local_username: None,
-            local_comm: None,
-        }
+            None,
+        )
     }
 
     #[test]

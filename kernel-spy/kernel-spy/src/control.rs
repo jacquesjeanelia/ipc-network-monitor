@@ -11,6 +11,41 @@ use aya::maps::{HashMap, MapData};
 use common::ControlAuditEntry;
 use kernel_spy_common::BlocklistIpv6Key;
 
+fn sanitize_audit_action(action: &str) -> String {
+    const MAX: usize = 128;
+    action
+        .chars()
+        .map(|c| if matches!(c, '\n' | '\r') { '_' } else { c })
+        .take(MAX)
+        .collect()
+}
+
+/// One JSON line per audit entry: strip newlines from `detail` and cap length to limit log injection.
+fn sanitize_audit_outcome(outcome: &str) -> String {
+    const MAX: usize = 32;
+    outcome
+        .chars()
+        .map(|c| if matches!(c, '\n' | '\r') { '_' } else { c })
+        .take(MAX)
+        .collect()
+}
+
+fn sanitize_audit_detail(detail: &str) -> String {
+    const MAX: usize = 4096;
+    let one_line: String = detail
+        .chars()
+        .map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c })
+        .collect();
+    if one_line.len() <= MAX {
+        one_line
+    } else {
+        let take = MAX.saturating_sub(24);
+        let mut s: String = one_line.chars().take(take).collect();
+        s.push_str("…(truncated)");
+        s
+    }
+}
+
 /// write ipv4 blocklist into ebpf `BLOCKLIST_MAP` (replaces prior keys — clear map first if you care)
 pub fn apply_blocklist<T: BorrowMut<MapData>>(
     map: &mut HashMap<T, u32, u8>,
@@ -75,9 +110,9 @@ pub fn audit(
         .unwrap_or(0);
     let entry = ControlAuditEntry {
         ts_unix_ms: ts,
-        action: action.to_string(),
-        detail: detail.to_string(),
-        outcome: outcome.map(|s| s.to_string()),
+        action: sanitize_audit_action(action),
+        detail: sanitize_audit_detail(detail),
+        outcome: outcome.map(sanitize_audit_outcome),
         session_id: session_id.map(|s| s.to_string()),
     };
     let line = serde_json::to_string(&entry)?;
@@ -118,5 +153,27 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(s.lines().next().unwrap()).expect("json");
         assert_eq!(v["session_id"], "sess-test");
         assert_eq!(v["outcome"], "success");
+    }
+
+    #[test]
+    fn audit_sanitizes_newlines_and_truncates_detail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("audit.jsonl");
+        let long = "x".repeat(5000);
+        let detail = format!("prefix\nBAD{long}");
+        audit(
+            Some(&p),
+            "test\naction",
+            &detail,
+            Some("success"),
+            None,
+        )
+        .expect("audit");
+        let line = std::fs::read_to_string(&p).expect("read");
+        let v: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).expect("json");
+        assert!(!v["action"].as_str().unwrap().contains('\n'));
+        assert!(!v["detail"].as_str().unwrap().contains('\n'));
+        assert!(v["detail"].as_str().unwrap().contains("truncated"));
+        assert!(v["detail"].as_str().unwrap().len() <= 4200);
     }
 }

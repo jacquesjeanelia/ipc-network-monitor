@@ -8,7 +8,7 @@ use aya_ebpf::{
     maps::HashMap,
     programs::{TcContext, TracePointContext, XdpContext},
 };
-use aya_ebpf::helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid};
+use aya_ebpf::helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid};
 use kernel_spy_common::{
     BlocklistIpv6Key, FlowMapCapacity, HealthCounterIndex, PacketMetadata, PacketMetadataV6,
     PidComm,
@@ -66,8 +66,8 @@ static BLOCKLIST6_MAP: HashMap<BlocklistIpv6Key, u8> =
 #[map]
 static HEALTH_COUNTERS: Array<u64> = Array::with_max_entries(8, 0);
 
-/// sport (host byte order) → pid+comm recorded when TCP reaches ESTABLISHED
-/// lets userspace attribute short-lived processes that exit before /proc scan
+/// sport (host byte order) → pid, real uid/gid, comm on TCP state transitions (SYN_SENT / SYN_RECV / ESTABLISHED)
+/// so userspace can attribute short-lived processes that exit before a `/proc` scan
 #[map]
 static SOCK_SPORT_PID: HashMap<u16, PidComm> = HashMap::with_max_entries(4096, 0);
 
@@ -487,7 +487,7 @@ pub fn tcp_tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
     0
 }
 
-/// `sock:inet_sock_set_state` — record pid+comm when TCP reaches ESTABLISHED (newstate==1)
+/// `sock:inet_sock_set_state` — record pid, real uid/gid, and comm for TCP SYN_SENT / SYN_RECV / ESTABLISHED.
 /// Format offsets (stable since Linux 4.16):
 ///   offset 16: oldstate (i32), offset 20: newstate (i32), offset 24: sport (u16)
 #[tracepoint(category = "sock", name = "inet_sock_set_state")]
@@ -496,21 +496,24 @@ pub fn sock_inet_sock_set_state(ctx: TracePointContext) -> u32 {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    // TCP_ESTABLISHED == 1
-    if newstate != 1 {
+    // TCP_ESTABLISHED == 1, TCP_SYN_SENT == 2, TCP_SYN_RECV == 3
+    if newstate != 1 && newstate != 2 && newstate != 3 {
         return 0;
     }
     let sport: u16 = match unsafe { ctx.read_at(24) } {
         Ok(v) => v,
         Err(_) => return 0,
     };
-    let pid_tgid = unsafe { bpf_get_current_pid_tgid() };
+    let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
     if pid == 0 {
         return 0;
     }
-    let comm = unsafe { bpf_get_current_comm() }.unwrap_or([0u8; 16]);
-    let entry = PidComm::new(pid, comm);
+    let ug = bpf_get_current_uid_gid();
+    let uid = ug as u32;
+    let gid = (ug >> 32) as u32;
+    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    let entry = PidComm::new(pid, uid, gid, comm);
     let _ = SOCK_SPORT_PID.insert(&sport, &entry, 0);
     0
 }

@@ -82,13 +82,27 @@ See [docs/CAPABILITY_REQUIREMENTS.md](../docs/CAPABILITY_REQUIREMENTS.md) for de
     Maximum flow rows per direction in export. Default: 500.
     Larger values = more memory/export size.
 
+--nft-policy-rules-refresh-ms <MS>
+    Minimum time between `nft list table inet ipc_netmon` runs used to refresh parsed rules for
+    `policy_impact` in each snapshot. Default: 5000. Use 0 to re-list every tick (higher CPU).
+    On failure, the next attempt is still spaced by this interval (avoids hammering `nft` when the
+    table is missing).
+
+--proc-inode-cache-refresh-ms <MS>
+    When PID correlation is on, minimum time between full `/proc/*/fd` inode walks. Default: 0
+    (refresh every tick). Set to e.g. 1000–5000 to cut CPU on busy hosts (inode cache may be stale
+    for new sockets until the next refresh).
+
 --proc-pid-correlation [true|false]
     Enable inode-to-PID correlation (scanning /proc/*/fd). Default: true.
     Disable for low-CPU mode (flow PIDs will be 'unknown').
 
 --ss-enrich [true|false]
-    When true, always run an extra ss(8) pass each tick. By default, ss is still run whenever
-    any flow row lacks a PID (merging host `ss` with optional netns output). Default: false.
+    When true, always run an extra ss(8) pass each tick. Default: false.
+
+--ss-autofill-min-interval-ms <MS>
+    When `--ss-enrich` is false, still run `ss` to fill missing PIDs, but at most this often.
+    Default: 3000. Use 0 to run `ss` every tick while any flow lacks a PID (old behavior).
 
 --ss-netns <NAME>
     Also run `ip netns exec <NAME> ss -tu -n -H -p` and merge with host `ss` for PID matching.
@@ -202,6 +216,8 @@ CLI flags override TOML values.
 
 All methods are JSON request-response over `--control-socket`. Full RPC reference in [kernel-spy/src/control_rpc.rs](src/control_rpc.rs).
 
+**Safety (brief):** File-write RPCs reject paths containing `..` and very long paths. Successful **`nft_apply_*`** responses include a stable **`policy_id`** (see `policy_impact` in `common`). Audit lines sanitize newlines and cap `detail` length — see [docs/SECURITY_MODEL.md](../docs/SECURITY_MODEL.md).
+
 ### ping
 
 ```json
@@ -234,7 +250,7 @@ Export snapshots to file.
 → {"ok":true,"data":{"preview":"table inet ipc_netmon {...}"}}
 
 {"method":"nft_apply_drop","params":{"dst":"8.8.8.8"}}
-→ {"ok":true,"data":{"backup":"/tmp/.../nft-backup-T.json"}}
+→ {"ok":true,"data":{"backup":"/tmp/.../nft_ruleset_backup.nft","policy_id":"nft:output:ip_daddr:8.8.8.8:drop"}}
 
 {"method":"nft_preview_rate_limit","params":{"dst":"203.0.113.1","rate":"10 mbytes/second"}}
 → {"ok":true,"data":{"preview":"..."}}

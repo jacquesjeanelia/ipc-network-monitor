@@ -1,0 +1,23 @@
+[package]
+name = "netmon-desktop"
+version = "0.1.0"
+description = "NetMon desktop: Tauri + Unix export/control IPC (no HTTP bridge in-process)"
+authors = ["ipc-network-monitor"]
+edition.workspace = true
+license.workspace = true
+repository = ""
+
+[lib]
+name = "netmon_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+common = { path = "../../common" }
+log.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.11", features = [] }
+tauri-plugin-log = "2"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

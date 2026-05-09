@@ -37,6 +37,18 @@ eBPF programs in kernel-spy-ebpf monitor XDP and TC hooks:
 
 **Limitation:** eBPF kernel programs do not have direct access to process identity. They can only track packets at the network layer.
 
+### 1b. TCP sport → PID / UID / GID / comm (from eBPF tracepoint)
+
+A separate **HashMap** `SOCK_SPORT_PID` (key: local TCP **sport**, host order; value: `PidComm`) is filled in kernel space on the **`sock:inet_sock_set_state`** tracepoint when TCP enters **SYN_SENT**, **SYN_RECV**, or **ESTABLISHED**. The program records the current task’s **PID**, **TGID-scoped comm**, **real UID/GID** (`bpf_get_current_uid_gid`), and the socket’s local port.
+
+Userspace uses this map only for flows that still lack a PID after inode correlation: it tries `src_port` and `dst_port` as candidate local sports (RX often carries the ephemeral in `dst_port`). That path improves attribution for **very short-lived** TCP clients that vanish before the next `/proc` snapshot.
+
+**Caveats:**
+
+- **UDP** and non-TCP protocols are **not** populated by this map; inode + `/proc` (and optional `ss`) remain the source of truth there unless additional programs are added later.
+- **Login names** still come from userspace (`passwd` / `users` crate) using the resolved UID; eBPF does not ship usernames.
+- When the process **still exists**, `enrich_flow_rows` prefers **`/proc/<pid>/status`** for UID/GID (namespaces, setuid) and merges eBPF values only as a fallback when `/proc` is unavailable.
+
 ### 2. Inode-to-PID Mapping (from /proc)
 
 The correlation pipeline builds an **in-memory cache** at snapshot time:

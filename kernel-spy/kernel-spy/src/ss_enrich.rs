@@ -290,8 +290,15 @@ mod tests {
             bytes: 94,
             local_pid: None,
             local_uid: None,
+            local_gid: None,
             local_username: None,
             local_comm: None,
+            attribution_confidence: String::new(),
+            attribution_reasons: vec![],
+            attribution_path: String::new(),
+            netns: None,
+            cgroup: None,
+            container_hint: None,
         };
         let ss = SsRow {
             proto: 17,
@@ -332,8 +339,15 @@ mod tests {
             bytes: 1,
             local_pid: None,
             local_uid: None,
+            local_gid: None,
             local_username: None,
             local_comm: None,
+            attribution_confidence: String::new(),
+            attribution_reasons: vec![],
+            attribution_path: String::new(),
+            netns: None,
+            cgroup: None,
+            container_hint: None,
         }];
         let ss = SsRow {
             proto: 6,

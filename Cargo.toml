@@ -4,6 +4,7 @@ exclude = ["kernel-spy/kernel-spy-ebpf"]
 members = [
     "common",
     "collector",
+    "web/src-tauri",
     "ui",
     "kernel-spy/kernel-spy",
     "kernel-spy/kernel-spy-common",

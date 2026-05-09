@@ -68,6 +68,7 @@ fn fmt_ts_ms(ts_ms: u64) -> String {
 fn flow_row_has_attribution(row: &FlowRow) -> bool {
     row.local_pid.is_some()
         || row.local_uid.is_some()
+        || row.local_gid.is_some()
         || row.local_username.as_deref().is_some_and(|s| !s.is_empty())
         || row.local_comm.as_deref().is_some_and(|s| !s.is_empty())
 }
@@ -96,6 +97,12 @@ fn fmt_flow_attribution(row: &FlowRow) -> String {
             s.push_str(" · ");
         }
         s.push_str(&format!("uid={u}"));
+    }
+    if let Some(g) = row.local_gid {
+        if !s.is_empty() {
+            s.push_str(" · ");
+        }
+        s.push_str(&format!("gid={g}"));
     }
     s
 }
@@ -199,6 +206,9 @@ struct SharedState {
     rx_rate_history: VecDeque<[f64; 2]>,
     tx_rate_history: VecDeque<[f64; 2]>,
     port_rate_history: VecDeque<[f64; 2]>,
+    conntrack_util_history: VecDeque<[f64; 2]>,
+    conntrack_insert_failed_history: VecDeque<[f64; 2]>,
+    nic_rx_dropped_history: VecDeque<[f64; 2]>,
     proto_history: VecDeque<ProtoSnapshot>,
     prev_rx_bytes: Option<u64>,
     prev_tx_bytes: Option<u64>,
@@ -221,6 +231,9 @@ impl SharedState {
             rx_rate_history: VecDeque::new(),
             tx_rate_history: VecDeque::new(),
             port_rate_history: VecDeque::new(),
+            conntrack_util_history: VecDeque::new(),
+            conntrack_insert_failed_history: VecDeque::new(),
+            nic_rx_dropped_history: VecDeque::new(),
             proto_history: VecDeque::new(),
             prev_rx_bytes: None,
             prev_tx_bytes: None,
@@ -255,6 +268,9 @@ impl SharedState {
     }
 
     fn ingest(&mut self, snap: MonitorSnapshotV1) {
+        // Any parsed snapshot means the export socket delivered data (same idea as web `netmon-link`
+        // vs first `read_line` race).
+        self.connected = true;
         let elapsed = self.start.elapsed().as_secs_f64();
 
         let mut port_bytes_cur: Option<u64> = None;
@@ -303,6 +319,22 @@ impl SharedState {
         // Protocol breakdown snapshot
         let mut all_flows: Vec<FlowRow> = snap.flows_rx.clone();
         all_flows.extend_from_slice(&snap.flows_tx);
+        let nic_rx_dropped_delta: u64 = snap.nic_stats_delta.iter().map(|r| r.rx_dropped).sum();
+        if self.conntrack_util_history.len() >= HISTORY_CAP {
+            self.conntrack_util_history.pop_front();
+        }
+        self.conntrack_util_history
+            .push_back([elapsed, snap.conntrack.utilization_percent]);
+        if self.conntrack_insert_failed_history.len() >= HISTORY_CAP {
+            self.conntrack_insert_failed_history.pop_front();
+        }
+        self.conntrack_insert_failed_history
+            .push_back([elapsed, snap.conntrack_delta.insert_failed as f64]);
+        if self.nic_rx_dropped_history.len() >= HISTORY_CAP {
+            self.nic_rx_dropped_history.pop_front();
+        }
+        self.nic_rx_dropped_history
+            .push_back([elapsed, nic_rx_dropped_delta as f64]);
         let proto = classify_flow_bytes(&all_flows);
         if self.proto_history.len() >= PROTO_HISTORY_CAP { self.proto_history.pop_front(); }
         self.proto_history.push_back(proto_snapshot_elapsed(proto, elapsed));
@@ -329,6 +361,15 @@ enum Tab {
     Settings,
 }
 
+/// Sub-pages under Dashboard (everything available; use toggles + pages to reduce noise).
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum DashboardPage {
+    Overview,
+    Traffic,
+    Attribution,
+    KernelHealth,
+}
+
 struct App {
     state: Arc<Mutex<SharedState>>,
     active_tab: Tab,
@@ -337,6 +378,26 @@ struct App {
     rate_input: String,
     uid_input: String,
     gid_input: String,
+    simulate_lookback_mins: String,
+    sim_medium_bytes_input: String,
+    sim_high_bytes_input: String,
+    sim_medium_ratio_input: String,
+    sim_high_ratio_input: String,
+    alert_softnet_warn_input: String,
+    alert_softnet_crit_input: String,
+    alert_listen_warn_input: String,
+    alert_listen_crit_input: String,
+    alert_conntrack_util_warn_input: String,
+    alert_conntrack_util_crit_input: String,
+    alert_conntrack_insert_failed_warn_input: String,
+    alert_conntrack_insert_failed_crit_input: String,
+    alert_nic_rx_dropped_warn_input: String,
+    alert_nic_rx_dropped_crit_input: String,
+    dashboard_page: DashboardPage,
+    /// Show zero-byte protocols in Traffic protocol bars.
+    dash_show_proto_zeros: bool,
+    /// Extra diagnostic row on Overview (TCP softnet overflows, etc.).
+    dash_show_overview_extended: bool,
 }
 
 impl App {
@@ -350,6 +411,24 @@ impl App {
             rate_input: "1 mbytes/second".to_string(),
             uid_input: String::new(),
             gid_input: String::new(),
+            simulate_lookback_mins: "10".to_string(),
+            sim_medium_bytes_input: (5_u64 << 20).to_string(),
+            sim_high_bytes_input: (50_u64 << 20).to_string(),
+            sim_medium_ratio_input: "0.25".to_string(),
+            sim_high_ratio_input: "0.55".to_string(),
+            alert_softnet_warn_input: "1".to_string(),
+            alert_softnet_crit_input: "10".to_string(),
+            alert_listen_warn_input: "1".to_string(),
+            alert_listen_crit_input: "5".to_string(),
+            alert_conntrack_util_warn_input: "70".to_string(),
+            alert_conntrack_util_crit_input: "90".to_string(),
+            alert_conntrack_insert_failed_warn_input: "1".to_string(),
+            alert_conntrack_insert_failed_crit_input: "10".to_string(),
+            alert_nic_rx_dropped_warn_input: "1".to_string(),
+            alert_nic_rx_dropped_crit_input: "50".to_string(),
+            dashboard_page: DashboardPage::Overview,
+            dash_show_proto_zeros: false,
+            dash_show_overview_extended: false,
         }
     }
 
@@ -410,7 +489,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(500));
 
-        let (connected, snap, rx_hist, tx_hist, port_hist, proto_hist, alert_log, rpc_result, recent_procs, recent_users) = {
+        let (connected, snap, rx_hist, tx_hist, port_hist, ct_util_hist, ct_insert_failed_hist, nic_rx_drop_hist, proto_hist, alert_log, rpc_result, recent_procs, recent_users) = {
             let s = self.state.lock().unwrap();
             (
                 s.connected,
@@ -418,6 +497,9 @@ impl eframe::App for App {
                 s.rx_rate_history.iter().cloned().collect::<Vec<_>>(),
                 s.tx_rate_history.iter().cloned().collect::<Vec<_>>(),
                 s.port_rate_history.iter().cloned().collect::<Vec<_>>(),
+                s.conntrack_util_history.iter().cloned().collect::<Vec<_>>(),
+                s.conntrack_insert_failed_history.iter().cloned().collect::<Vec<_>>(),
+                s.nic_rx_dropped_history.iter().cloned().collect::<Vec<_>>(),
                 s.proto_history.iter().cloned().collect::<Vec<_>>(),
                 s.alert_log.clone(),
                 s.rpc_result.clone(),
@@ -444,9 +526,17 @@ impl eframe::App for App {
                         if connected {
                             ui.colored_label(CLR_ACCENT, "●");
                             ui.label(RichText::new("LIVE").size(11.0).color(CLR_ACCENT).strong());
+                        } else if snap.is_some() {
+                            ui.colored_label(Color32::from_rgb(0xe7, 0xa2, 0x3d), "●");
+                            ui.label(
+                                RichText::new("STALE")
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(0xe7, 0xa2, 0x3d))
+                                    .strong(),
+                            );
                         } else {
                             ui.colored_label(CLR_RED, "●");
-                            ui.label(RichText::new("Offline").size(11.0).color(CLR_RED));
+                            ui.label(RichText::new("No feed").size(11.0).color(CLR_RED));
                         }
                     });
                 });
@@ -559,7 +649,7 @@ impl eframe::App for App {
                             ui.colored_label(CLR_MUTED, format!("session: {short}"));
                             ui.separator();
                             ui.colored_label(CLR_MUTED, format!("iface: {}", s.iface));
-                        } else if !connected {
+                        } else if snap.is_none() {
                             ui.colored_label(CLR_RED,
                                 RichText::new("Waiting for kernel-spy export socket…").size(12.0));
                         }
@@ -574,7 +664,7 @@ impl eframe::App for App {
                 .inner_margin(Margin::same(20.0)))
             .show(ctx, |ui| {
                 match self.active_tab {
-                    Tab::Dashboard  => self.show_dashboard(ui, snap.as_ref(), &rx_hist, &tx_hist, &port_hist, &proto_hist),
+                    Tab::Dashboard  => self.show_dashboard(ui, snap.as_ref(), &rx_hist, &tx_hist, &port_hist, &ct_util_hist, &ct_insert_failed_hist, &nic_rx_drop_hist, &proto_hist),
                     Tab::Flows      => self.show_flows(ui, snap.as_ref()),
                     Tab::Processes  => self.show_processes(ui, snap.as_ref(), &recent_procs, &recent_users),
                     Tab::Audit      => self.show_audit(ui, snap.as_ref(), &alert_log),
@@ -583,6 +673,281 @@ impl eframe::App for App {
                 }
             });
     }
+}
+
+// ── Dashboard helpers ────────────────────────────────────────────────────────
+
+fn cache_age_label(now_ms: u64, marker_ms: u64) -> String {
+    if marker_ms == 0 {
+        return "—".to_string();
+    }
+    let d = now_ms.saturating_sub(marker_ms);
+    if d < 1500 {
+        "fresh".to_string()
+    } else if d < 60_000 {
+        format!("{}s", d / 1000)
+    } else if d < 3_600_000 {
+        format!("{}m", d / 60_000)
+    } else {
+        format!("{}h", d / 3_600_000)
+    }
+}
+
+fn glance_strip(ui: &mut Ui, snap: &MonitorSnapshotV1) {
+    let nic_rx_drop: u64 = snap.nic_stats_delta.iter().map(|r| r.rx_dropped).sum();
+    let nft_age = if snap.probe_status.nftables_ready {
+        cache_age_label(snap.ts_unix_ms, snap.collector_cache.nft_rules_last_ok_unix_ms)
+    } else {
+        "off".to_string()
+    };
+    let proc_age = cache_age_label(snap.ts_unix_ms, snap.collector_cache.proc_inode_cache_unix_ms);
+    egui::Frame::none()
+        .fill(CLR_PANEL)
+        .stroke(Stroke::new(1.0, CLR_BORDER))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::same(14.0))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                glance_item(ui, "IFACE", &snap.iface, CLR_BLUE_LIGHT);
+                glance_item(
+                    ui,
+                    "coverage",
+                    &format!("{:.1}% attrib", snap.attribution_coverage_percent),
+                    if snap.attribution_coverage_percent >= 80.0 {
+                        CLR_GREEN
+                    } else {
+                        CLR_YELLOW
+                    },
+                );
+                glance_item(
+                    ui,
+                    "alerts/tick",
+                    &snap.alerts.len().to_string(),
+                    if snap.alerts.is_empty() {
+                        CLR_GREEN
+                    } else {
+                        CLR_YELLOW
+                    },
+                );
+                glance_item(
+                    ui,
+                    "conntrack",
+                    &format!("{:.1}% util", snap.conntrack.utilization_percent),
+                    if snap.conntrack.utilization_percent < 70.0 {
+                        CLR_GREEN
+                    } else {
+                        CLR_YELLOW
+                    },
+                );
+                glance_item(ui, "softnet_drop/tick", &snap.softnet_delta.dropped.to_string(), CLR_MUTED);
+                glance_item(ui, "nic rx_drop Δ", &nic_rx_drop.to_string(), CLR_MUTED);
+                glance_item(
+                    ui,
+                    "tick",
+                    &format!("{} ms", snap.collector_tick.tick_wall_ms),
+                    CLR_MUTED,
+                );
+                glance_item(ui, "nft Δ", &nft_age, CLR_MUTED);
+                glance_item(ui, "proc Δ", &proc_age, CLR_MUTED);
+            });
+        });
+}
+
+fn glance_item(ui: &mut Ui, k: &str, v: &str, vc: Color32) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new(k).small().color(CLR_MUTED));
+        ui.label(RichText::new(v).size(13.5).strong().color(vc));
+    });
+    ui.add_space(14.0);
+}
+
+fn proto_bars_filtered(
+    ui: &mut Ui,
+    cl: &ProtoSnapshot,
+    proto_total: u64,
+    show_zeros: bool,
+) {
+    let rows: &[(&str, u64, Color32)] = &[
+        ("TCP", cl.tcp_bytes, CLR_BLUE_LIGHT),
+        ("UDP", cl.udp_bytes, CLR_BLUE_MID),
+        ("ICMP", cl.icmp_bytes, CLR_BLUE_DIM),
+        ("ICMPv6", cl.icmpv6_bytes, CLR_BLUE_DIM),
+        ("IGMP", cl.igmp_bytes, CLR_PURPLE),
+        ("GRE", cl.gre_bytes, CLR_PURPLE),
+        ("SCTP", cl.sctp_bytes, CLR_PURPLE),
+        ("ESP", cl.esp_bytes, CLR_ORANGE),
+        ("AH", cl.ah_bytes, CLR_MUTED),
+        ("Other", cl.other_bytes, CLR_MUTED),
+    ];
+    egui::Frame::none()
+        .fill(CLR_CARD)
+        .stroke(Stroke::new(1.0, CLR_BORDER))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::same(10.0))
+        .show(ui, |ui| {
+            for &(name, bytes, col) in rows {
+                if !show_zeros && bytes == 0 && name != "Other" && name != "TCP" && name != "UDP"
+                {
+                    continue;
+                }
+                if !show_zeros && bytes == 0 && (name == "Other") {
+                    continue;
+                }
+                proto_bar(ui, name, bytes, proto_total, col);
+                ui.add_space(4.0);
+            }
+        });
+}
+
+fn kernel_metrics_grid(ui: &mut Ui, snap: &MonitorSnapshotV1) {
+    let nic_rx_delta: u64 = snap.nic_stats_delta.iter().map(|r| r.rx_dropped).sum();
+    let nic_tx_delta: u64 = snap.nic_stats_delta.iter().map(|r| r.tx_dropped).sum();
+    egui::Frame::none()
+        .fill(CLR_CARD)
+        .stroke(Stroke::new(1.0, CLR_BORDER))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::same(12.0))
+        .show(ui, |ui| {
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                egui::Grid::new("kernel_snap_grid")
+                    .striped(true)
+                    .spacing([20.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Metric").small().strong());
+                        ui.label(RichText::new("Absolute / counters").small().strong());
+                        ui.label(RichText::new("Δ / tick").small().strong());
+                        ui.end_row();
+
+                        ui.label("Conntrack entries");
+                        ui.label(format!("{} / {}", snap.conntrack.count, snap.conntrack.max.max(1)));
+                        ui.label("—");
+                        ui.end_row();
+                        ui.label("Conntrack util");
+                        ui.label(format!("{:.1}%", snap.conntrack.utilization_percent));
+                        ui.label(format!(
+                            "+{} insert_fail  +{} drops",
+                            snap.conntrack_delta.insert_failed,
+                            snap.conntrack_delta.drop
+                        ));
+                        ui.end_row();
+                        ui.label("Softnet");
+                        ui.monospace(format!(
+                            "dropped {}",
+                            snap.softnet.dropped
+                        ));
+                        ui.monospace(format!("Δ {}", snap.softnet_delta.dropped));
+                        ui.end_row();
+                        ui.label("TCP stack (TcpExt)");
+                        ui.monospace(format!(
+                            "timeouts {}",
+                            snap.tcp_kernel.tcp_timeouts
+                        ));
+                        ui.monospace(format!(
+                            "overflows {} LIST drop {} backlog {}",
+                            snap.tcp_kernel_delta.listen_overflows,
+                            snap.tcp_kernel_delta.listen_drops,
+                            snap.tcp_kernel_delta.tcp_backlog_drop
+                        ));
+                        ui.end_row();
+                        ui.label("Handshake");
+                        ui.monospace(format!(
+                            "syn_retrans {}",
+                            snap.tcp_handshake.syn_retrans
+                        ));
+                        ui.monospace(format!(
+                            "syncookies {}Δ  failed {}Δ",
+                            snap.tcp_handshake_delta.syncookies_sent,
+                            snap.tcp_handshake_delta.syncookies_failed,
+                        ));
+                        ui.end_row();
+                        ui.label("NIC drops (Δ)");
+                        ui.label(format!(
+                            "cumulative netdev rx:{} tx:?",
+                            snap.health.netdev_rx_dropped.unwrap_or(0),
+                        ));
+                        ui.monospace(format!("rxΔ {nic_rx_delta}  txΔ {nic_tx_delta}"));
+                        ui.end_row();
+                        ui.label("IP frag/reasm");
+                        ui.monospace(format!(
+                            "reasmFails {}",
+                            snap.ip_frag.reasm_fails,
+                        ));
+                        ui.monospace(format!(
+                            "reasmFails {}Δ fragFails {}Δ",
+                            snap.ip_frag_delta.reasm_fails,
+                            snap.ip_frag_delta.frag_fails,
+                        ));
+                        ui.end_row();
+                        ui.label("Socket pressure");
+                        ui.monospace(format!(
+                            "tcp_mem {} orphans {}",
+                            snap.socket_pressure.tcp_mem,
+                            snap.socket_pressure.tcp_orphan
+                        ));
+                        ui.label(format!("TW {}", snap.socket_pressure.tcp_tw));
+                        ui.end_row();
+                    });
+            });
+        });
+}
+
+fn dashboard_trend_plot(
+    ui: &mut Ui,
+    id: &str,
+    title_line: &str,
+    points: &[[f64; 2]],
+    line_color: Color32,
+    warn: Option<f64>,
+    crit: Option<f64>,
+    _y_hint: &str,
+) {
+    if points.is_empty() {
+        ui.label(RichText::new(format!("{title_line} — waiting for samples…")).small().color(CLR_MUTED));
+        return;
+    }
+    let min_x = points.first().map(|p| p[0]).unwrap_or(0.0);
+    let max_x = points.last().map(|p| p[0]).unwrap_or(min_x + 1.0);
+    egui::Frame::none()
+        .fill(CLR_CARD)
+        .stroke(Stroke::new(1.0, CLR_BORDER))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(Margin::same(8.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new(title_line).size(11.5).color(CLR_MUTED));
+            Plot::new(id)
+                .height(150.0)
+                .allow_boxed_zoom(false)
+                .allow_drag(false)
+                .allow_scroll(false)
+                .allow_zoom(false)
+                .include_y(0.0)
+                .show_axes([true, true])
+                .legend(Legend::default())
+                .show(ui, |pui| {
+                    if let Some(y) = warn {
+                        pui.line(
+                            Line::new(PlotPoints::new(vec![[min_x, y], [max_x, y]]))
+                                .color(CLR_YELLOW.gamma_multiply(0.7))
+                                .name("Warn")
+                                .width(1.0),
+                        );
+                    }
+                    if let Some(y) = crit {
+                        pui.line(
+                            Line::new(PlotPoints::new(vec![[min_x, y], [max_x, y]]))
+                                .color(CLR_RED.gamma_multiply(0.85))
+                                .name("Critical")
+                                .width(1.0),
+                        );
+                    }
+                    pui.line(
+                        Line::new(PlotPoints::new(points.to_vec()))
+                            .color(line_color)
+                            .name("value")
+                            .width(2.0),
+                    );
+                });
+        });
 }
 
 // ── Dashboard ────────────────────────────────────────────────────────────────
@@ -595,6 +960,9 @@ impl App {
         rx_hist: &[[f64; 2]],
         tx_hist: &[[f64; 2]],
         port_hist: &[[f64; 2]],
+        ct_util_hist: &[[f64; 2]],
+        _ct_insert_failed_hist: &[[f64; 2]],
+        nic_rx_drop_hist: &[[f64; 2]],
         proto_hist: &[ProtoSnapshot],
     ) {
         let Some(snap) = snap else {
@@ -636,227 +1004,186 @@ impl App {
         }
         let port_list: Vec<u16> = ports_seen.into_iter().take(48).collect();
 
-        // ── two-column layout ─────────────────────────────────────────
-        let avail = ui.available_width();
-        let left_w  = avail * 0.42;
-        let right_w = avail * 0.56;
 
-        ui.horizontal_top(|ui| {
-            // ── LEFT COLUMN ──────────────────────────────────────────
-            ui.allocate_ui(Vec2::new(left_w, ui.available_height()), |ui| {
-                ui.vertical(|ui| {
-                    // ── stat cards row ────────────────────────────────
-                    section_header(ui, "Overview");
-                    ui.add_space(6.0);
+            ui.spacing_mut().item_spacing = Vec2::new(14.0, 12.0);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("View").small().color(CLR_MUTED));
+                let pages = [
+                    (DashboardPage::Overview, "Overview"),
+                    (DashboardPage::Traffic, "Traffic"),
+                    (DashboardPage::Attribution, "Attribution"),
+                    (DashboardPage::KernelHealth, "Kernel health"),
+                ];
+                for (page, lab) in pages {
+                    let sel = self.dashboard_page == page;
+                    let r = ui.selectable_label(sel, RichText::new(lab).strong().size(13.5));
+                    if r.clicked() {
+                        self.dashboard_page = page;
+                    }
+                }
+            });
+
+            egui::CollapsingHeader::new(RichText::new("Display options").strong().size(12.5))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.checkbox(&mut self.dash_show_proto_zeros, "Show zero-byte protocols (Traffic)");
+                    ui.checkbox(&mut self.dash_show_overview_extended, "Show extended diagnostics (Overview)");
+                });
+
+            ui.add_space(4.0);
+            glance_strip(ui, snap);
+
+            match self.dashboard_page {
+                DashboardPage::Overview => {
+                    section_header(ui, "Throughput & coverage");
+                    ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
-                        big_stat(ui, "↓ RX Pkts",   &snap.rx.packets.to_string(), CLR_BLUE_LIGHT);
-                        big_stat(ui, "↓ RX Bytes",  &fmt_bytes(snap.rx.bytes),    CLR_ACCENT);
-                        big_stat(ui, "↑ TX Pkts",   &snap.tx.packets.to_string(), CLR_BLUE_MID);
-                        big_stat(ui, "↑ TX Bytes",  &fmt_bytes(snap.tx.bytes),    CLR_BLUE_LIGHT);
+                        big_stat(ui, "↓ RX Pkts", &snap.rx.packets.to_string(), CLR_BLUE_LIGHT);
+                        big_stat(ui, "↓ RX Bytes", &fmt_bytes(snap.rx.bytes), CLR_ACCENT);
+                        big_stat(ui, "↑ TX Pkts", &snap.tx.packets.to_string(), CLR_BLUE_MID);
+                        big_stat(ui, "↑ TX Bytes", &fmt_bytes(snap.tx.bytes), CLR_BLUE_LIGHT);
+                        big_stat(
+                            ui,
+                            "Attribution",
+                            &format!("{:.1}%", snap.attribution_coverage_percent),
+                            if snap.attribution_coverage_percent >= 80.0 {
+                                CLR_GREEN
+                            } else {
+                                CLR_YELLOW
+                            },
+                        );
                     });
 
                     ui.add_space(14.0);
-
-                    // ── health pills ──────────────────────────────────
-                    section_header(ui, "Health");
-                    ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        health_pill(ui, "TCP Retransmits", snap.health.tcp_retransmit_skb);
-                        health_pill(ui, "Policy Drops",    snap.health.policy_drops);
-                        if let Some(v) = snap.health.netdev_rx_dropped { health_pill(ui, "NIC RX Drop", v); }
-                        if let Some(v) = snap.health.netdev_tx_dropped { health_pill(ui, "NIC TX Drop", v); }
-                    });
-
-                    ui.add_space(10.0);
-
-                    // ── probe status pills ────────────────────────────
-                    section_header(ui, "Probe Status");
+                    section_header(ui, "Probe status");
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
                         let ps = &snap.probe_status;
-                        probe_pill(ui, "XDP",           ps.xdp_attached);
-                        probe_pill(ui, "TC egress",     ps.tc_egress_attached);
-                        probe_pill(ui, "tcp_retransmit",ps.tcp_retransmit_trace_attached);
-                        probe_pill(ui, "nftables",      ps.nftables_ready);
+                        probe_pill(ui, "XDP", ps.xdp_attached);
+                        probe_pill(ui, "TC egress", ps.tc_egress_attached);
+                        probe_pill(ui, "tcp_retransmit", ps.tcp_retransmit_trace_attached);
+                        probe_pill(ui, "nftables", ps.nftables_ready);
                     });
                     for err in &snap.probe_status.errors {
                         ui.colored_label(CLR_YELLOW, format!("⚠ {err}"));
                     }
 
-                    ui.add_space(14.0);
-
-                    // ── protocol distribution ─────────────────────────
-                    section_header(ui, "Protocol Distribution  (this tick)");
-                    ui.add_space(6.0);
-                    egui::Frame::none()
-                        .fill(CLR_CARD)
-                        .stroke(Stroke::new(1.0, CLR_BORDER))
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::same(10.0))
-                        .show(ui, |ui| {
-                            proto_bar(ui, "TCP",     cl.tcp_bytes,    proto_total, CLR_BLUE_LIGHT);
-                            ui.add_space(4.0);
-                            proto_bar(ui, "UDP",     cl.udp_bytes,    proto_total, CLR_BLUE_MID);
-                            ui.add_space(4.0);
-                            proto_bar(ui, "ICMP",    cl.icmp_bytes,   proto_total, CLR_BLUE_DIM);
-                            ui.add_space(4.0);
-                            proto_bar(ui, "ICMPv6",  cl.icmpv6_bytes, proto_total, CLR_BLUE_DIM);
-                            ui.add_space(4.0);
-                            proto_bar(ui, "IGMP",    cl.igmp_bytes,   proto_total, CLR_PURPLE);
-                            ui.add_space(4.0);
-                            proto_bar(ui, "GRE",     cl.gre_bytes,    proto_total, CLR_PURPLE);
-                            ui.add_space(4.0);
-                            proto_bar(ui, "SCTP",    cl.sctp_bytes,   proto_total, CLR_PURPLE);
-                            ui.add_space(4.0);
-                            proto_bar(ui, "ESP",     cl.esp_bytes,    proto_total, CLR_ORANGE);
-                            ui.add_space(4.0);
-                            proto_bar(ui, "AH",      cl.ah_bytes,     proto_total, CLR_MUTED);
-                            ui.add_space(4.0);
-                            proto_bar(ui, "Other",   cl.other_bytes,  proto_total, CLR_MUTED);
+                    if self.dash_show_overview_extended {
+                        ui.add_space(14.0);
+                        section_header(ui, "Diagnostics (tick deltas)");
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            health_pill(ui, "TCP retr", snap.health.tcp_retransmit_skb);
+                            health_pill(ui, "Policy drops", snap.health.policy_drops);
+                            health_pill(ui, "TCP timeoutsΔ", snap.tcp_kernel_delta.tcp_timeouts);
+                            health_pill(ui, "Listen overflowΔ", snap.tcp_kernel_delta.listen_overflows);
+                            health_pill(ui, "Softnet droppedΔ", snap.softnet_delta.dropped);
+                            if let Some(v) = snap.health.netdev_rx_dropped {
+                                health_pill(ui, "NIC rx dropΣ", v);
+                            }
                         });
+                    }
 
-                    // ── current-tick alerts ───────────────────────────
                     if !snap.alerts.is_empty() {
                         ui.add_space(14.0);
-                        section_header(ui, "Active Alerts");
-                        ui.add_space(4.0);
+                        section_header(ui, "Alerts (this snapshot)");
+                        ui.add_space(6.0);
                         for a in &snap.alerts {
                             alert_row(ui, a);
                         }
                     }
-                });
-            });
-
-            ui.add_space(12.0);
-
-            // ── RIGHT COLUMN ─────────────────────────────────────────
-            ui.allocate_ui(Vec2::new(right_w, ui.available_height()), |ui| {
-                ui.vertical(|ui| {
-                    // ── live throughput chart ─────────────────────────
-                    section_header(ui, "Live Throughput");
-                    ui.add_space(4.0);
+                }
+                DashboardPage::Traffic => {
+                    section_header(ui, "Live throughput");
+                    ui.add_space(6.0);
                     let rx_rate = rx_hist.last().map(|p| p[1]).unwrap_or(0.0);
                     let tx_rate = tx_hist.last().map(|p| p[1]).unwrap_or(0.0);
                     let port_rate = port_hist.last().map(|p| p[1]).unwrap_or(0.0);
                     ui.horizontal(|ui| {
                         rate_badge(ui, "↓ RX", rx_rate, CLR_BLUE_LIGHT);
-                        ui.add_space(8.0);
+                        ui.add_space(12.0);
                         rate_badge(ui, "↑ TX", tx_rate, CLR_ACCENT);
                         if sel_port.is_some() {
-                            ui.add_space(8.0);
+                            ui.add_space(12.0);
                             rate_badge(ui, "Port Σ", port_rate, CLR_BLUE_LIGHT);
                         }
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Chart port (src or dst match)").size(11.0).color(CLR_MUTED));
+                        ui.label(
+                            RichText::new("Highlight port flow sum (flows matching src/dst)")
+                                .size(11.5)
+                                .color(CLR_MUTED),
+                        );
                         egui::ComboBox::from_id_salt("dash_mon_port")
-                            .width(100.0)
+                            .width(112.0)
                             .selected_text(match sel_port {
-                                None => "None".to_string(),
+                                None => "None".into(),
                                 Some(p) => p.to_string(),
                             })
                             .show_ui(ui, |ui| {
                                 if ui.selectable_label(sel_port.is_none(), "None").clicked() {
                                     sel_port = None;
                                 }
-                                for &p in &port_list {
-                                    let lab = p.to_string();
-                                    if ui.selectable_label(sel_port == Some(p), &lab).clicked() {
-                                        sel_port = Some(p);
+                                for &pp in &port_list {
+                                    if ui
+                                        .selectable_label(sel_port == Some(pp), pp.to_string())
+                                        .clicked()
+                                    {
+                                        sel_port = Some(pp);
                                     }
                                 }
                             });
                     });
-                    ui.add_space(6.0);
                     egui::Frame::none()
                         .fill(CLR_CARD)
                         .stroke(Stroke::new(1.0, CLR_BORDER))
                         .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::same(8.0))
+                        .inner_margin(Margin::same(10.0))
                         .show(ui, |ui| {
-                            Plot::new("throughput")
-                                .height(300.0)
+                            Plot::new("dash_throughput")
+                                .height(280.0)
                                 .include_y(0.0)
                                 .legend(Legend::default())
                                 .x_axis_label("Elapsed (s)")
                                 .y_axis_label("Bytes/s")
                                 .show(ui, |pui| {
                                     if !rx_hist.is_empty() {
-                                        pui.line(Line::new(PlotPoints::new(rx_hist.to_vec()))
-                                            .color(CLR_BLUE_LIGHT).name("RX (B/s)").width(2.0));
+                                        pui.line(
+                                            Line::new(PlotPoints::new(rx_hist.to_vec()))
+                                                .color(CLR_BLUE_LIGHT)
+                                                .name("RX (B/s)")
+                                                .width(2.0),
+                                        );
                                     }
                                     if !tx_hist.is_empty() {
-                                        pui.line(Line::new(PlotPoints::new(tx_hist.to_vec()))
-                                            .color(CLR_ACCENT).name("TX (B/s)").width(2.0));
+                                        pui.line(
+                                            Line::new(PlotPoints::new(tx_hist.to_vec()))
+                                                .color(CLR_ACCENT)
+                                                .name("TX (B/s)")
+                                                .width(2.0),
+                                        );
                                     }
                                     if sel_port.is_some() && !port_hist.is_empty() {
-                                        let name = format!(
-                                            "Flows port {} (B/s)",
-                                            sel_port.unwrap()
+                                        let nm = format!("Flows port {} (B/s)", sel_port.unwrap());
+                                        pui.line(
+                                            Line::new(PlotPoints::new(port_hist.to_vec()))
+                                                .color(CLR_BLUE_LIGHT)
+                                                .name(nm)
+                                                .width(1.8),
                                         );
-                                        pui.line(Line::new(PlotPoints::new(port_hist.to_vec()))
-                                            .color(CLR_BLUE_LIGHT).name(name).width(1.8));
                                     }
                                 });
                         });
 
-                    ui.add_space(14.0);
+                    ui.add_space(16.0);
+                    section_header(ui, "Protocol shares (this tick)");
+                    ui.add_space(6.0);
+                    proto_bars_filtered(ui, &cl, proto_total, self.dash_show_proto_zeros);
 
-                    // ── protocol breakdown over time chart ────────────
-                    section_header(ui, "Protocol Breakdown over Time");
-                    ui.add_space(4.0);
-                    egui::Frame::none()
-                        .fill(CLR_CARD)
-                        .stroke(Stroke::new(1.0, CLR_BORDER))
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::same(8.0))
-                        .show(ui, |ui| {
-                            Plot::new("proto_breakdown")
-                                .height(220.0)
-                                .include_y(0.0)
-                                .legend(Legend::default())
-                                .x_axis_label("Elapsed (s)")
-                                .y_axis_label("Bytes")
-                                .show(ui, |pui| {
-                                    if !proto_hist.is_empty() {
-                                        let tcp_pts: Vec<[f64; 2]> = proto_hist.iter()
-                                            .map(|p| [p.elapsed, p.tcp_bytes as f64]).collect();
-                                        let udp_pts: Vec<[f64; 2]> = proto_hist.iter()
-                                            .map(|p| [p.elapsed, p.udp_bytes as f64]).collect();
-                                        let icmp_pts: Vec<[f64; 2]> = proto_hist.iter()
-                                            .map(|p| [p.elapsed, p.icmp_bytes as f64]).collect();
-                                        let icmpv6_pts: Vec<[f64; 2]> = proto_hist.iter()
-                                            .map(|p| [p.elapsed, p.icmpv6_bytes as f64]).collect();
-                                        let rest_pts: Vec<[f64; 2]> = proto_hist.iter()
-                                            .map(|p| {
-                                                let r = p.igmp_bytes
-                                                    .saturating_add(p.gre_bytes)
-                                                    .saturating_add(p.sctp_bytes)
-                                                    .saturating_add(p.esp_bytes)
-                                                    .saturating_add(p.ah_bytes)
-                                                    .saturating_add(p.other_bytes);
-                                                [p.elapsed, r as f64]
-                                            })
-                                            .collect();
-                                        pui.line(Line::new(PlotPoints::new(tcp_pts))
-                                            .color(CLR_BLUE_LIGHT).name("TCP").width(1.5));
-                                        pui.line(Line::new(PlotPoints::new(udp_pts))
-                                            .color(CLR_BLUE_MID).name("UDP").width(1.5));
-                                        pui.line(Line::new(PlotPoints::new(icmp_pts))
-                                            .color(CLR_BLUE_DIM).name("ICMP").width(1.5));
-                                        pui.line(Line::new(PlotPoints::new(icmpv6_pts))
-                                            .color(CLR_PURPLE).name("ICMPv6").width(1.5));
-                                        pui.line(Line::new(PlotPoints::new(rest_pts))
-                                            .color(CLR_MUTED).name("Other L4+").width(1.2));
-                                    }
-                                });
-                        });
-
-                    ui.add_space(14.0);
-
-                    // ── top 5 processes ───────────────────────────────
-                    section_header(ui, "Top 5 Processes");
+                    ui.add_space(16.0);
+                    section_header(ui, "Protocols over elapsed time");
                     ui.add_space(6.0);
                     egui::Frame::none()
                         .fill(CLR_CARD)
@@ -864,37 +1191,255 @@ impl App {
                         .rounding(Rounding::same(8.0))
                         .inner_margin(Margin::same(10.0))
                         .show(ui, |ui| {
+                            Plot::new("dash_proto_hist")
+                                .height(210.0)
+                                .include_y(0.0)
+                                .legend(Legend::default())
+                                .x_axis_label("Elapsed (s)")
+                                .y_axis_label("Bytes")
+                                .show(ui, |pui| {
+                                    if proto_hist.is_empty() {
+                                        return;
+                                    }
+                                    let tcp_pts: Vec<[f64; 2]> =
+                                        proto_hist.iter().map(|p| [p.elapsed, p.tcp_bytes as f64]).collect();
+                                    let udp_pts: Vec<[f64; 2]> =
+                                        proto_hist.iter().map(|p| [p.elapsed, p.udp_bytes as f64]).collect();
+                                    let icmp_pts: Vec<[f64; 2]> =
+                                        proto_hist.iter().map(|p| [p.elapsed, p.icmp_bytes as f64]).collect();
+                                    let icmpv6_pts: Vec<[f64; 2]> =
+                                        proto_hist.iter().map(|p| [p.elapsed, p.icmpv6_bytes as f64]).collect();
+                                    let rest_pts: Vec<[f64; 2]> = proto_hist
+                                        .iter()
+                                        .map(|p| {
+                                            let r = p.igmp_bytes
+                                                .saturating_add(p.gre_bytes)
+                                                .saturating_add(p.sctp_bytes)
+                                                .saturating_add(p.esp_bytes)
+                                                .saturating_add(p.ah_bytes)
+                                                .saturating_add(p.other_bytes);
+                                            [p.elapsed, r as f64]
+                                        })
+                                        .collect();
+                                    pui.line(Line::new(PlotPoints::new(tcp_pts))
+                                        .color(CLR_BLUE_LIGHT)
+                                        .name("TCP")
+                                        .width(1.5));
+                                    pui.line(Line::new(PlotPoints::new(udp_pts))
+                                        .color(CLR_BLUE_MID)
+                                        .name("UDP")
+                                        .width(1.5));
+                                    pui.line(Line::new(PlotPoints::new(icmp_pts))
+                                        .color(CLR_BLUE_DIM)
+                                        .name("ICMP")
+                                        .width(1.5));
+                                    pui.line(Line::new(PlotPoints::new(icmpv6_pts))
+                                        .color(CLR_PURPLE)
+                                        .name("ICMPv6")
+                                        .width(1.5));
+                                    pui.line(Line::new(PlotPoints::new(rest_pts))
+                                        .color(CLR_MUTED)
+                                        .name("Other L4+")
+                                        .width(1.2));
+                                });
+                        });
+
+                    ui.add_space(16.0);
+                    section_header(ui, "Top processes (this snapshot)");
+                    ui.add_space(6.0);
+                    egui::Frame::none()
+                        .fill(CLR_CARD)
+                        .stroke(Stroke::new(1.0, CLR_BORDER))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::same(12.0))
+                        .show(ui, |ui| {
                             if snap.aggregates_by_pid.is_empty() {
-                                ui.colored_label(CLR_MUTED, "No process attribution yet.");
+                                ui.colored_label(CLR_MUTED, "No PID attribution rows yet.");
                             } else {
-                                for row in snap.aggregates_by_pid.iter().take(5) {
-                                    let comm = row.comm.as_deref().unwrap_or("unknown");
+                                for row in snap.aggregates_by_pid.iter().take(8) {
+                                    let comm = row.comm.as_deref().unwrap_or("?");
                                     ui.horizontal(|ui| {
-                                        ui.label(RichText::new(format!("pid {}", row.pid))
-                                            .size(11.0).color(CLR_MUTED).monospace());
-                                        ui.add_space(4.0);
-                                        ui.label(RichText::new(comm).color(CLR_ACCENT).size(12.0));
+                                        ui.monospace(format!("{}", row.pid));
+                                        ui.label(RichText::new(comm).strong().color(CLR_ACCENT));
                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            ui.label(RichText::new(
-                                                format!("{:.1}%", row.share_percent)
-                                            ).size(11.0).color(CLR_MUTED));
-                                            ui.add_space(4.0);
-                                            ui.label(RichText::new(fmt_bytes(row.bytes_total))
-                                                .size(11.5).color(CLR_BLUE_LIGHT));
+                                            ui.label(
+                                                RichText::new(fmt_bytes(row.bytes_total))
+                                                    .color(CLR_TEXT),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("{:.0}% ", row.share_percent))
+                                                    .color(CLR_MUTED),
+                                            );
                                         });
                                     });
-                                    let frac = (row.share_percent as f32 / 100.0).clamp(0.0, 1.0);
-                                    ui.add(egui::ProgressBar::new(frac)
-                                        .desired_width(ui.available_width())
-                                        .fill(CLR_ACCENT));
-                                    ui.add_space(4.0);
+                                    ui.add(egui::ProgressBar::new(
+                                        (row.share_percent as f32 / 100.0).clamp(0.0, 1.0),
+                                    )
+                                    .fill(CLR_ACCENT));
+                                    ui.add_space(8.0);
                                 }
                             }
                         });
-                });
-            });
+                }
+                DashboardPage::Attribution => {
+                    section_header(ui, "Attribution overview");
+                    ui.add_space(8.0);
+                    egui::Frame::none()
+                        .fill(CLR_PANEL)
+                        .rounding(Rounding::same(10.0))
+                        .inner_margin(Margin::same(16.0))
+                        .stroke(Stroke::new(1.0, CLR_BORDER))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:.1}% of sampled flows mapped to UID/PID/context",
+                                    snap.attribution_coverage_percent
+                                ))
+                                .size(15.0)
+                                .strong()
+                                .color(CLR_TEXT_BRIGHT),
+                            );
+                        });
+
+                    ui.add_space(16.0);
+                    section_header(ui, "Unresolved attribution buckets");
+                    ui.add_space(6.0);
+                    egui::Frame::none()
+                        .fill(CLR_CARD)
+                        .stroke(Stroke::new(1.0, CLR_BORDER))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::same(12.0))
+                        .show(ui, |ui| {
+                            if snap.unknown_attribution_buckets.is_empty() {
+                                ui.colored_label(CLR_GREEN, "All sampled flows accounted for ✓");
+                            } else {
+                                egui::Grid::new("unk_attr")
+                                    .striped(true)
+                                    .spacing([18.0, 8.0])
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new("Signal").weak());
+                                        ui.label(RichText::new("Flows").weak());
+                                        ui.end_row();
+                                        for bucket in &snap.unknown_attribution_buckets {
+                                            ui.monospace(&bucket.kind);
+                                            ui.label(bucket.count.to_string());
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                        });
+
+                    ui.add_space(16.0);
+                    section_header(ui, "Workload pressure — cgroup aggregates");
+                    ui.add_space(6.0);
+                    egui::Frame::none()
+                        .fill(CLR_CARD)
+                        .stroke(Stroke::new(1.0, CLR_BORDER))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::same(12.0))
+                        .show(ui, |ui| {
+                            if snap.cgroup_pressure.is_empty() {
+                                ui.colored_label(CLR_MUTED, "No cgroup hints on sampled flows.");
+                            } else {
+                                for row in snap.cgroup_pressure.iter().take(12) {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&row.cgroup).small().weak(),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui.label(
+                                                RichText::new(fmt_bytes(row.bytes_total))
+                                                    .strong(),
+                                            );
+                                        });
+                                    });
+                                }
+                            }
+                        });
+                }
+                DashboardPage::KernelHealth => {
+                    ui.label(
+                        RichText::new(
+                            "Snapshot + per-tick deltas from /proc counters. Charts use your Settings thresholds.",
+                        )
+                        .small()
+                        .color(CLR_MUTED),
+                    );
+                    ui.add_space(8.0);
+                    kernel_metrics_grid(ui, snap);
+
+                    ui.add_space(16.0);
+                    let ct_w = self
+                        .alert_conntrack_util_warn_input
+                        .trim()
+                        .parse::<f64>()
+                        .ok();
+                    let ct_c = self
+                        .alert_conntrack_util_crit_input
+                        .trim()
+                        .parse::<f64>()
+                        .ok();
+                    let nic_w = self
+                        .alert_nic_rx_dropped_warn_input
+                        .trim()
+                        .parse::<f64>()
+                        .ok();
+                    let nic_c = self
+                        .alert_nic_rx_dropped_crit_input
+                        .trim()
+                        .parse::<f64>()
+                        .ok();
+
+                    dashboard_trend_plot(
+                        ui,
+                        "kern_ct_util_wide",
+                        "Conntrack utilization % vs warn/critical (elapsed s)",
+                        ct_util_hist,
+                        CLR_BLUE_LIGHT,
+                        ct_w,
+                        ct_c,
+                        "",
+                    );
+                    dashboard_trend_plot(
+                        ui,
+                        "kern_nic_drop_wide",
+                        "NIC Σ rx_dropped Δ/tick vs warn/critical (elapsed s)",
+                        nic_rx_drop_hist,
+                        CLR_ORANGE,
+                        nic_w,
+                        nic_c,
+                        "",
+                    );
+
+                    egui::CollapsingHeader::new(
+                        RichText::new("More: drop attribution & taxonomy").small().strong(),
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::Grid::new("drop_tax")
+                            .striped(true)
+                            .spacing([18.0, 6.0])
+                            .show(ui, |ui| {
+                                if snap.drop_reasons.is_empty() {
+                                    ui.colored_label(CLR_MUTED, "No drop signals this tick.");
+                                } else {
+                                    for row in &snap.drop_reasons {
+                                        ui.monospace(&row.reason);
+                                        ui.label(format!(
+                                            "{}   ({:.0}%)",
+                                            row.count_delta, row.percent
+                                        ));
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    });
+                }
+            }
         });
-    });
         if let Ok(mut s) = self.state.lock() {
             s.selected_port = sel_port;
         }
@@ -914,7 +1459,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("🔍").size(14.0));
                 ui.add(egui::TextEdit::singleline(&mut self.flow_filter)
-                    .hint_text("Filter: IP, port, protocol, user — or pid:1234 …")
+                    .hint_text("Filter: IP, port, protocol, user, gid — or pid:1234 …")
                     .desired_width(520.0));
                 if !self.flow_filter.is_empty() {
                     if styled_btn(ui, "✕ Clear").clicked() {
@@ -963,6 +1508,9 @@ impl App {
                             || r.protocol.to_lowercase().contains(filter_lc)
                             || r.local_username.as_deref().unwrap_or("").to_lowercase().contains(filter_lc)
                             || r.local_comm.as_deref().unwrap_or("").to_lowercase().contains(filter_lc)
+                            || r.local_gid
+                                .map(|g| filter_lc.contains(&g.to_string()))
+                                .unwrap_or(false)
                             || r.local_pid
                                 .map(|p| filter_lc.contains(&p.to_string()))
                                 .unwrap_or(false)
@@ -1255,6 +1803,98 @@ impl App {
             } else {
                 ui.colored_label(CLR_MUTED, "No snapshot yet — start kernel-spy to see iface.");
             }
+            ui.add_space(14.0);
+            section_header(ui, "Live Alert Thresholds");
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("softnet warn").color(CLR_MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.alert_softnet_warn_input).desired_width(90.0));
+                ui.label(RichText::new("softnet critical").color(CLR_MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.alert_softnet_crit_input).desired_width(90.0));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("listen warn").color(CLR_MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.alert_listen_warn_input).desired_width(90.0));
+                ui.label(RichText::new("listen critical").color(CLR_MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.alert_listen_crit_input).desired_width(90.0));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("conntrack util warn %").color(CLR_MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.alert_conntrack_util_warn_input).desired_width(90.0));
+                ui.label(RichText::new("conntrack util critical %").color(CLR_MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.alert_conntrack_util_crit_input).desired_width(90.0));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("conntrack insert_failed warn").color(CLR_MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.alert_conntrack_insert_failed_warn_input).desired_width(90.0));
+                ui.label(RichText::new("conntrack insert_failed critical").color(CLR_MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.alert_conntrack_insert_failed_crit_input).desired_width(90.0));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("NIC rx_dropped warn").color(CLR_MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.alert_nic_rx_dropped_warn_input).desired_width(90.0));
+                ui.label(RichText::new("NIC rx_dropped critical").color(CLR_MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.alert_nic_rx_dropped_crit_input).desired_width(90.0));
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if styled_btn(ui, "Load current").clicked() {
+                    let r = self.rpc("alert_thresholds_get", serde_json::Value::Null);
+                    self.set_rpc_result(r.clone());
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&r) {
+                        if let Some(d) = v.get("data") {
+                            if let Some(x) = d.get("softnet_warn_per_tick").and_then(|x| x.as_u64()) {
+                                self.alert_softnet_warn_input = x.to_string();
+                            }
+                            if let Some(x) = d.get("softnet_crit_per_tick").and_then(|x| x.as_u64()) {
+                                self.alert_softnet_crit_input = x.to_string();
+                            }
+                            if let Some(x) = d.get("listen_warn_per_tick").and_then(|x| x.as_u64()) {
+                                self.alert_listen_warn_input = x.to_string();
+                            }
+                            if let Some(x) = d.get("listen_crit_per_tick").and_then(|x| x.as_u64()) {
+                                self.alert_listen_crit_input = x.to_string();
+                            }
+                            if let Some(x) = d.get("conntrack_util_warn_percent").and_then(|x| x.as_u64()) {
+                                self.alert_conntrack_util_warn_input = x.to_string();
+                            }
+                            if let Some(x) = d.get("conntrack_util_crit_percent").and_then(|x| x.as_u64()) {
+                                self.alert_conntrack_util_crit_input = x.to_string();
+                            }
+                            if let Some(x) = d.get("conntrack_insert_failed_warn_per_tick").and_then(|x| x.as_u64()) {
+                                self.alert_conntrack_insert_failed_warn_input = x.to_string();
+                            }
+                            if let Some(x) = d.get("conntrack_insert_failed_crit_per_tick").and_then(|x| x.as_u64()) {
+                                self.alert_conntrack_insert_failed_crit_input = x.to_string();
+                            }
+                            if let Some(x) = d.get("nic_rx_dropped_warn_per_tick").and_then(|x| x.as_u64()) {
+                                self.alert_nic_rx_dropped_warn_input = x.to_string();
+                            }
+                            if let Some(x) = d.get("nic_rx_dropped_crit_per_tick").and_then(|x| x.as_u64()) {
+                                self.alert_nic_rx_dropped_crit_input = x.to_string();
+                            }
+                        }
+                    }
+                }
+                if styled_btn(ui, "Apply live").clicked() {
+                    let r = self.rpc(
+                        "alert_thresholds_set",
+                        serde_json::json!({
+                            "softnet_warn_per_tick": self.alert_softnet_warn_input.trim().parse::<u64>().ok(),
+                            "softnet_crit_per_tick": self.alert_softnet_crit_input.trim().parse::<u64>().ok(),
+                            "listen_warn_per_tick": self.alert_listen_warn_input.trim().parse::<u64>().ok(),
+                            "listen_crit_per_tick": self.alert_listen_crit_input.trim().parse::<u64>().ok(),
+                            "conntrack_util_warn_percent": self.alert_conntrack_util_warn_input.trim().parse::<u64>().ok(),
+                            "conntrack_util_crit_percent": self.alert_conntrack_util_crit_input.trim().parse::<u64>().ok(),
+                            "conntrack_insert_failed_warn_per_tick": self.alert_conntrack_insert_failed_warn_input.trim().parse::<u64>().ok(),
+                            "conntrack_insert_failed_crit_per_tick": self.alert_conntrack_insert_failed_crit_input.trim().parse::<u64>().ok(),
+                            "nic_rx_dropped_warn_per_tick": self.alert_nic_rx_dropped_warn_input.trim().parse::<u64>().ok(),
+                            "nic_rx_dropped_crit_per_tick": self.alert_nic_rx_dropped_crit_input.trim().parse::<u64>().ok()
+                        }),
+                    );
+                    self.set_rpc_result(r);
+                }
+            });
         });
     }
 
@@ -1387,6 +2027,180 @@ impl App {
 // ── Control tab ───────────────────────────────────────────────────────────────
 
 impl App {
+    fn show_policy_simulation_card(&self, ui: &mut Ui, rpc_result: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(rpc_result) else {
+            return;
+        };
+        let Some(data) = v.get("data") else {
+            return;
+        };
+        if data.get("matched_flows").is_none() || data.get("matched_bytes").is_none() {
+            return;
+        }
+
+        let matched_flows = data.get("matched_flows").and_then(|x| x.as_u64()).unwrap_or(0);
+        let matched_bytes = data.get("matched_bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+        let lookback = data
+            .get("lookback_minutes")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let confidence = data
+            .get("confidence_mix")
+            .and_then(|x| x.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let high_conf = confidence.get("high").and_then(|x| x.as_u64()).unwrap_or(0);
+        let medium_conf = confidence
+            .get("medium")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        let low_conf = confidence.get("low").and_then(|x| x.as_u64()).unwrap_or(0);
+        let none_conf = confidence.get("none").and_then(|x| x.as_u64()).unwrap_or(0);
+        let uncertain_ratio = data
+            .get("uncertain_ratio")
+            .and_then(|x| x.as_f64())
+            .unwrap_or_else(|| {
+                let total_conf = high_conf + medium_conf + low_conf + none_conf;
+                if total_conf == 0 {
+                    1.0
+                } else {
+                    (low_conf + none_conf) as f64 / total_conf as f64
+                }
+            });
+        let risk_level = data
+            .get("risk_level")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown");
+        let recommendation = data
+            .get("recommendation")
+            .and_then(|x| x.as_str())
+            .unwrap_or("No recommendation available.");
+        let (risk_label, risk_color) = match risk_level {
+            "high" => ("High risk", CLR_RED),
+            "medium" => ("Medium risk", CLR_YELLOW),
+            "low" => ("Low risk", CLR_GREEN),
+            _ => ("Unknown", CLR_MUTED),
+        };
+
+        ui.add_space(16.0);
+        section_header(ui, "Policy Simulation Summary");
+        ui.add_space(6.0);
+        egui::Frame::none()
+            .fill(CLR_CARD)
+            .stroke(Stroke::new(1.0, CLR_BORDER))
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::same(12.0))
+            .show(ui, |ui| {
+                let ring_n = data.get("ring_snapshot_count").and_then(|x| x.as_u64()).unwrap_or(0);
+                let win_n = data
+                    .get("lookback_snapshot_count")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                ui.horizontal_wrapped(|ui| {
+                    kv_pair(ui, "Lookback", &format!("{lookback} min"));
+                    ui.separator();
+                    kv_pair(ui, "Ring snaps", &ring_n.to_string());
+                    ui.separator();
+                    kv_pair(ui, "In window", &win_n.to_string());
+                    ui.separator();
+                    kv_pair(ui, "Matched flows", &matched_flows.to_string());
+                    ui.separator();
+                    kv_pair(ui, "Matched bytes", &fmt_bytes(matched_bytes));
+                    ui.separator();
+                    ui.label(RichText::new("Risk").small().color(CLR_MUTED));
+                    ui.label(
+                        RichText::new(risk_label)
+                            .small()
+                            .strong()
+                            .color(risk_color),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.label(RichText::new("Attribution confidence mix").small().color(CLR_MUTED));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("high {high_conf}")).small().color(CLR_GREEN));
+                    ui.label(
+                        RichText::new(format!("medium {medium_conf}"))
+                            .small()
+                            .color(CLR_YELLOW),
+                    );
+                    ui.label(RichText::new(format!("low {low_conf}")).small().color(CLR_ORANGE));
+                    ui.label(RichText::new(format!("none {none_conf}")).small().color(CLR_RED));
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "Uncertain attribution ratio: {:.1}% — {}",
+                        uncertain_ratio * 100.0,
+                        recommendation
+                    ))
+                    .small()
+                    .color(if risk_label == "High risk" { CLR_RED } else { CLR_MUTED }),
+                );
+                if let Some(th) = data.get("risk_thresholds").and_then(|x| x.as_object()) {
+                    ui.label(
+                        RichText::new(format!(
+                            "Thresholds: medium_bytes={} high_bytes={} medium_ratio={:.2} high_ratio={:.2}",
+                            th.get("medium_bytes").and_then(|x| x.as_u64()).unwrap_or(0),
+                            th.get("high_bytes").and_then(|x| x.as_u64()).unwrap_or(0),
+                            th.get("medium_uncertain_ratio").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                            th.get("high_uncertain_ratio").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                        ))
+                        .small()
+                        .color(CLR_MUTED),
+                    );
+                }
+
+                if let Some(top_pids) = data.get("top_pids").and_then(|x| x.as_array()) {
+                    if !top_pids.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Top impacted processes").small().color(CLR_MUTED));
+                        for row in top_pids.iter().take(5) {
+                            let pid = row.get("pid").and_then(|x| x.as_u64()).unwrap_or(0);
+                            let bytes = row.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("pid {pid}")).small().monospace().color(CLR_TEXT));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(RichText::new(fmt_bytes(bytes)).small().color(CLR_BLUE_LIGHT));
+                                });
+                            });
+                        }
+                    }
+                }
+                if let Some(top_uids) = data.get("top_uids").and_then(|x| x.as_array()) {
+                    if !top_uids.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Top impacted UIDs").small().color(CLR_MUTED));
+                        for row in top_uids.iter().take(5) {
+                            let uid = row.get("uid").and_then(|x| x.as_u64()).unwrap_or(0);
+                            let bytes = row.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("uid {uid}")).small().monospace().color(CLR_TEXT));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(RichText::new(fmt_bytes(bytes)).small().color(CLR_BLUE_LIGHT));
+                                });
+                            });
+                        }
+                    }
+                }
+                if let Some(top_gids) = data.get("top_gids").and_then(|x| x.as_array()) {
+                    if !top_gids.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Top impacted GIDs").small().color(CLR_MUTED));
+                        for row in top_gids.iter().take(5) {
+                            let gid = row.get("gid").and_then(|x| x.as_u64()).unwrap_or(0);
+                            let bytes = row.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("gid {gid}")).small().monospace().color(CLR_TEXT));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(RichText::new(fmt_bytes(bytes)).small().color(CLR_BLUE_LIGHT));
+                                });
+                            });
+                        }
+                    }
+                }
+            });
+    }
+
     fn show_control(&mut self, ui: &mut Ui, rpc_result: &str) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.colored_label(CLR_MUTED,
@@ -1442,6 +2256,91 @@ impl App {
             });
 
             ui.add_space(10.0);
+            control_section(ui, "Policy Simulation (Blast Radius)", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Lookback mins:").color(CLR_MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.simulate_lookback_mins).desired_width(90.0));
+                });
+                ui.add_space(6.0);
+                if styled_btn(ui, "Simulate policy impact").clicked() {
+                    let uid = self.uid_input.trim().parse::<u64>().ok();
+                    let gid = self.gid_input.trim().parse::<u64>().ok();
+                    let lookback_minutes = self
+                        .simulate_lookback_mins
+                        .trim()
+                        .parse::<u64>()
+                        .unwrap_or(10)
+                        .max(1);
+                    let r = self.rpc(
+                        "policy_simulate",
+                        serde_json::json!({
+                            "dst": self.ip_input.trim(),
+                            "uid": uid,
+                            "gid": gid,
+                            "lookback_minutes": lookback_minutes
+                        }),
+                    );
+                    self.set_rpc_result(r);
+                }
+            });
+
+            ui.add_space(10.0);
+            control_section(ui, "Simulation Risk Thresholds", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("medium_bytes").color(CLR_MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.sim_medium_bytes_input).desired_width(120.0));
+                    ui.label(RichText::new("high_bytes").color(CLR_MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.sim_high_bytes_input).desired_width(120.0));
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("medium_ratio").color(CLR_MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.sim_medium_ratio_input).desired_width(90.0));
+                    ui.label(RichText::new("high_ratio").color(CLR_MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.sim_high_ratio_input).desired_width(90.0));
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if styled_btn(ui, "Load current").clicked() {
+                        let r = self.rpc("policy_sim_get_thresholds", serde_json::Value::Null);
+                        self.set_rpc_result(r.clone());
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&r) {
+                            if let Some(d) = v.get("data") {
+                                if let Some(x) = d.get("medium_bytes").and_then(|x| x.as_u64()) {
+                                    self.sim_medium_bytes_input = x.to_string();
+                                }
+                                if let Some(x) = d.get("high_bytes").and_then(|x| x.as_u64()) {
+                                    self.sim_high_bytes_input = x.to_string();
+                                }
+                                if let Some(x) = d.get("medium_uncertain_ratio").and_then(|x| x.as_f64()) {
+                                    self.sim_medium_ratio_input = format!("{x:.2}");
+                                }
+                                if let Some(x) = d.get("high_uncertain_ratio").and_then(|x| x.as_f64()) {
+                                    self.sim_high_ratio_input = format!("{x:.2}");
+                                }
+                            }
+                        }
+                    }
+                    if styled_btn(ui, "Apply thresholds").clicked() {
+                        let medium_bytes = self.sim_medium_bytes_input.trim().parse::<u64>().ok();
+                        let high_bytes = self.sim_high_bytes_input.trim().parse::<u64>().ok();
+                        let medium_ratio = self.sim_medium_ratio_input.trim().parse::<f64>().ok();
+                        let high_ratio = self.sim_high_ratio_input.trim().parse::<f64>().ok();
+                        let r = self.rpc(
+                            "policy_sim_set_thresholds",
+                            serde_json::json!({
+                                "medium_bytes": medium_bytes,
+                                "high_bytes": high_bytes,
+                                "medium_uncertain_ratio": medium_ratio,
+                                "high_uncertain_ratio": high_ratio
+                            }),
+                        );
+                        self.set_rpc_result(r);
+                    }
+                });
+            });
+
+            ui.add_space(10.0);
             control_section(ui, "Drop by UID / GID", |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("UID:").color(CLR_MUTED));
@@ -1488,6 +2387,8 @@ impl App {
                     self.set_rpc_result(r);
                 }
             });
+
+            self.show_policy_simulation_card(ui, rpc_result);
 
             if !rpc_result.is_empty() {
                 ui.add_space(16.0);
@@ -1594,6 +2495,51 @@ fn rate_badge(ui: &mut Ui, label: &str, bps: f64, color: Color32) {
                 ui.label(RichText::new(label).size(12.0).color(CLR_MUTED));
                 ui.label(RichText::new(fmt_rate(bps)).size(15.0).strong().color(color));
             });
+        });
+}
+
+fn sparkline(
+    ui: &mut Ui,
+    id: &str,
+    points: &[[f64; 2]],
+    color: Color32,
+    warn: Option<f64>,
+    crit: Option<f64>,
+) {
+    if points.is_empty() {
+        ui.label(RichText::new("no trend yet").small().color(CLR_MUTED));
+        return;
+    }
+    let min_x = points.first().map(|p| p[0]).unwrap_or(0.0);
+    let max_x = points.last().map(|p| p[0]).unwrap_or(min_x + 1.0);
+    Plot::new(id)
+        .height(46.0)
+        .allow_boxed_zoom(false)
+        .allow_drag(false)
+        .allow_scroll(false)
+        .allow_zoom(false)
+        .show_axes([false, false])
+        .show_grid([false, false])
+        .show(ui, |pui| {
+            if let Some(y) = warn {
+                pui.line(
+                    Line::new(PlotPoints::new(vec![[min_x, y], [max_x, y]]))
+                        .color(CLR_YELLOW.gamma_multiply(0.75))
+                        .width(1.0),
+                );
+            }
+            if let Some(y) = crit {
+                pui.line(
+                    Line::new(PlotPoints::new(vec![[min_x, y], [max_x, y]]))
+                        .color(CLR_RED.gamma_multiply(0.85))
+                        .width(1.0),
+                );
+            }
+            pui.line(
+                Line::new(PlotPoints::new(points.to_vec()))
+                    .color(color)
+                    .width(1.8),
+            );
         });
 }
 

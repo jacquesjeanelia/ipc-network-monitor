@@ -171,6 +171,19 @@ sudo chown root:root /tmp/ipc-netmon-audit.log
 sudo chmod 0600 /tmp/ipc-netmon-audit.log
 ```
 
+### Audit detail hardening (control plane)
+
+- **`detail` and `action` fields** written by `kernel-spy` are **normalized to a single line** (newlines replaced) and **`detail` is capped** (currently 4096 characters) so a malicious or buggy RPC client cannot inject extra JSONL records or megabyte-long lines into the append-only file.
+- **`action` is capped** (128 characters) for the same reason.
+
+### RPC file-write paths
+
+Methods that write user-supplied paths (`session_dump_file`, CSV export when not `inline`, optional `nft_rollback` backup path) **reject paths containing `..`** and paths longer than **4096 bytes**. This blocks trivial directory-escape attempts over the control socket. **It does not replace** OS permissions: restrict `--state-dir`, socket permissions, and filesystem ACLs for production (see **IPC Isolation** above).
+
+### nft apply responses (`policy_id`)
+
+Successful **`nft_apply_*`** RPC responses include a stable **`policy_id`** string (same scheme as `policy_impact` / parsed nft rules) so operators can correlate an apply RPC, audit line, and dashboard policy rows without parsing nft handle output.
+
 ---
 
 ## Policy Change Safety (NFR-S2)

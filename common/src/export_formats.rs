@@ -39,8 +39,15 @@ pub fn snapshot_flows_to_csv(snapshot: &MonitorSnapshotV1) -> anyhow::Result<Str
             "bytes",
             "local_pid",
             "local_uid",
+            "local_gid",
             "local_username",
             "local_comm",
+            "attribution_confidence",
+            "attribution_path",
+            "attribution_reasons",
+            "netns",
+            "cgroup",
+            "container_hint",
         ],
     )?;
 
@@ -71,8 +78,15 @@ pub fn session_flows_to_csv(snaps: &[MonitorSnapshotV1]) -> anyhow::Result<Strin
             "bytes",
             "local_pid",
             "local_uid",
+            "local_gid",
             "local_username",
             "local_comm",
+            "attribution_confidence",
+            "attribution_path",
+            "attribution_reasons",
+            "netns",
+            "cgroup",
+            "container_hint",
         ],
     )?;
 
@@ -109,8 +123,15 @@ fn write_flow_row(
             flow.bytes.to_string(),
             opt_u32(flow.local_pid),
             opt_u32(flow.local_uid),
+            opt_u32(flow.local_gid),
             opt_str(flow.local_username.as_deref()).to_string(),
             opt_str(flow.local_comm.as_deref()).to_string(),
+            flow.attribution_confidence.clone(),
+            flow.attribution_path.clone(),
+            flow.attribution_reasons.join("|"),
+            opt_str(flow.netns.as_deref()).to_string(),
+            opt_str(flow.cgroup.as_deref()).to_string(),
+            opt_str(flow.container_hint.as_deref()).to_string(),
         ])
         .context("write flow csv row")
 }
@@ -274,8 +295,15 @@ mod tests {
                 bytes: 99,
                 local_pid: Some(1),
                 local_uid: Some(1000),
+                local_gid: Some(1000),
                 local_username: Some("alice".into()),
                 local_comm: Some("curl".into()),
+                attribution_confidence: "high".into(),
+                attribution_reasons: vec!["proc_inode_match".into()],
+                attribution_path: "proc_inode".into(),
+                netns: Some("root".into()),
+                cgroup: Some("/user.slice/user-1000.slice".into()),
+                container_hint: Some("host".into()),
             }],
             flows_tx: vec![],
             probe_status: Default::default(),
@@ -302,6 +330,32 @@ mod tests {
                 message: "traffic spike".into(),
                 severity: "warn".into(),
             }],
+            attribution_coverage_percent: 100.0,
+            unknown_attribution_buckets: vec![],
+            policy_impact: vec![],
+            tcp_kernel: Default::default(),
+            softnet: Default::default(),
+            tcp_kernel_delta: Default::default(),
+            softnet_delta: Default::default(),
+            conntrack: Default::default(),
+            conntrack_delta: Default::default(),
+            nic_stats: vec![],
+            nic_stats_delta: vec![],
+            socket_pressure: Default::default(),
+            cgroup_pressure: vec![],
+            drop_reasons: vec![],
+            tcp_handshake: Default::default(),
+            tcp_handshake_delta: Default::default(),
+            ip_frag: Default::default(),
+            ip_frag_delta: Default::default(),
+            kernel_snmp: Default::default(),
+            kernel_netstat: Default::default(),
+            sockstat: Default::default(),
+            sockstat6: Default::default(),
+            socket_table_lines: Default::default(),
+            ebpf_flow_maps: Default::default(),
+            collector_tick: Default::default(),
+            collector_cache: Default::default(),
         }
     }
 
@@ -322,7 +376,7 @@ mod tests {
     fn flows_csv_has_header_and_rows() {
         let csv = snapshot_flows_to_csv(&snapshot()).expect("csv");
         assert!(csv.contains("timestamp_ms,interface,direction,src_ip"));
-        assert!(csv.contains("42,eth0,rx,10.0.0.1,1234,8.8.8.8,53,UDP,99,1,1000,alice,curl"));
+        assert!(csv.contains("42,eth0,rx,10.0.0.1,1234,8.8.8.8,53,UDP,99,1,1000,1000,alice,curl"));
     }
 
     #[test]
@@ -351,8 +405,8 @@ mod tests {
         let snaps = vec![snapshot(), second_snapshot()];
 
         let flows = session_flows_to_csv(&snaps).expect("csv");
-        assert!(flows.contains("42,eth0,rx,10.0.0.1,1234,8.8.8.8,53,UDP,99,1,1000,alice,curl"));
-        assert!(flows.contains("99,wlan0,rx,10.0.0.2,1234,8.8.8.8,53,UDP,99,1,1000,alice,curl"));
+        assert!(flows.contains("42,eth0,rx,10.0.0.1,1234,8.8.8.8,53,UDP,99,1,1000,1000,alice,curl"));
+        assert!(flows.contains("99,wlan0,rx,10.0.0.2,1234,8.8.8.8,53,UDP,99,1,1000,1000,alice,curl"));
 
         let processes = session_processes_to_csv(&snaps).expect("csv");
         assert!(processes.contains("42,1,curl,99"));

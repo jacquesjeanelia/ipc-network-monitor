@@ -64,6 +64,36 @@ pub struct Cli {
     /// alert when top pid `bytes_total` in aggregates exceeds this (0 = off)
     #[arg(long, default_value_t = 0)]
     pub alert_top_pid_bytes: u64,
+    /// warn when softnet dropped delta per tick exceeds this (0 = off)
+    #[arg(long, default_value_t = 1)]
+    pub alert_softnet_dropped_warn_per_tick: u64,
+    /// critical when softnet dropped delta per tick exceeds this (0 = off)
+    #[arg(long, default_value_t = 10)]
+    pub alert_softnet_dropped_crit_per_tick: u64,
+    /// warn when listen overflows delta per tick exceeds this (0 = off)
+    #[arg(long, default_value_t = 1)]
+    pub alert_listen_overflows_warn_per_tick: u64,
+    /// critical when listen overflows delta per tick exceeds this (0 = off)
+    #[arg(long, default_value_t = 5)]
+    pub alert_listen_overflows_crit_per_tick: u64,
+    /// warn when conntrack utilization (%) exceeds this
+    #[arg(long, default_value_t = 70)]
+    pub alert_conntrack_util_warn_percent: u64,
+    /// critical when conntrack utilization (%) exceeds this
+    #[arg(long, default_value_t = 90)]
+    pub alert_conntrack_util_crit_percent: u64,
+    /// warn when conntrack insert_failed delta per tick exceeds this
+    #[arg(long, default_value_t = 1)]
+    pub alert_conntrack_insert_failed_warn_per_tick: u64,
+    /// critical when conntrack insert_failed delta per tick exceeds this
+    #[arg(long, default_value_t = 10)]
+    pub alert_conntrack_insert_failed_crit_per_tick: u64,
+    /// warn when NIC rx_dropped delta per tick exceeds this
+    #[arg(long, default_value_t = 1)]
+    pub alert_nic_rx_dropped_warn_per_tick: u64,
+    /// critical when NIC rx_dropped delta per tick exceeds this
+    #[arg(long, default_value_t = 50)]
+    pub alert_nic_rx_dropped_crit_per_tick: u64,
 
     /// skip export unix socket (stdout only)
     #[arg(long, default_value_t = false)]
@@ -76,6 +106,18 @@ pub struct Cli {
     /// skip attaching the `tcp:tcp_retransmit_skb` tracepoint
     #[arg(long, default_value_t = false)]
     pub skip_tcp_retransmit_trace: bool,
+
+    /// min milliseconds between `nft list table inet ipc_netmon` runs used to refresh parsed rules for `policy_impact` (0 = every tick)
+    #[arg(long, default_value_t = 5000)]
+    pub nft_policy_rules_refresh_ms: u64,
+
+    /// min milliseconds between full `/proc/*/fd` inode walks when PID correlation is on (0 = every tick)
+    #[arg(long, default_value_t = 0)]
+    pub proc_inode_cache_refresh_ms: u64,
+
+    /// when `ss` runs only to backfill missing PIDs (not `--ss-enrich`), do not run it more often than this (0 = every tick that still has missing PIDs)
+    #[arg(long, default_value_t = 3000)]
+    pub ss_autofill_min_interval_ms: u64,
 
     /// max flow rows per direction in json export
     #[arg(long, default_value_t = 256)]
@@ -108,6 +150,22 @@ pub struct Cli {
     /// optional append-only audit log for control-plane actions
     #[arg(long)]
     pub audit_log: Option<PathBuf>,
+
+    /// policy simulation medium-risk threshold in bytes
+    #[arg(long, default_value_t = 5_u64 << 20)]
+    pub policy_sim_medium_bytes: u64,
+
+    /// policy simulation high-risk threshold in bytes
+    #[arg(long, default_value_t = 50_u64 << 20)]
+    pub policy_sim_high_bytes: u64,
+
+    /// policy simulation medium-risk uncertain attribution ratio [0..1]
+    #[arg(long, default_value_t = 0.25)]
+    pub policy_sim_medium_uncertain_ratio: f64,
+
+    /// policy simulation high-risk uncertain attribution ratio [0..1]
+    #[arg(long, default_value_t = 0.55)]
+    pub policy_sim_high_uncertain_ratio: f64,
 }
 
 /// toml keys line up with these fields (deserialize is not magic io — we load explicitly)
@@ -126,9 +184,22 @@ pub struct ConfigFile {
     pub alert_rx_ema_delta_threshold: Option<u64>,
     pub alert_rx_ema_alpha: Option<f64>,
     pub alert_top_pid_bytes: Option<u64>,
+    pub alert_softnet_dropped_warn_per_tick: Option<u64>,
+    pub alert_softnet_dropped_crit_per_tick: Option<u64>,
+    pub alert_listen_overflows_warn_per_tick: Option<u64>,
+    pub alert_listen_overflows_crit_per_tick: Option<u64>,
+    pub alert_conntrack_util_warn_percent: Option<u64>,
+    pub alert_conntrack_util_crit_percent: Option<u64>,
+    pub alert_conntrack_insert_failed_warn_per_tick: Option<u64>,
+    pub alert_conntrack_insert_failed_crit_per_tick: Option<u64>,
+    pub alert_nic_rx_dropped_warn_per_tick: Option<u64>,
+    pub alert_nic_rx_dropped_crit_per_tick: Option<u64>,
     pub no_export_socket: Option<bool>,
     pub blocklist: Option<Vec<String>>,
     pub skip_tcp_retransmit_trace: Option<bool>,
+    pub nft_policy_rules_refresh_ms: Option<u64>,
+    pub proc_inode_cache_refresh_ms: Option<u64>,
+    pub ss_autofill_min_interval_ms: Option<u64>,
     pub max_flow_rows: Option<usize>,
     pub seed_demo_blocklist: Option<bool>,
     pub proc_pid_correlation: Option<bool>,
@@ -138,6 +209,10 @@ pub struct ConfigFile {
     pub audit_log: Option<PathBuf>,
     /// optional `tc netem` delay (ms) on root qdisc; privileged — see `tc_control`
     pub netem_delay_ms: Option<u32>,
+    pub policy_sim_medium_bytes: Option<u64>,
+    pub policy_sim_high_bytes: Option<u64>,
+    pub policy_sim_medium_uncertain_ratio: Option<f64>,
+    pub policy_sim_high_uncertain_ratio: Option<f64>,
 }
 
 impl ConfigFile {
@@ -161,11 +236,30 @@ pub struct EffectiveConfig {
     pub alert_rx_ema_delta_threshold: u64,
     pub alert_rx_ema_alpha: f64,
     pub alert_top_pid_bytes: u64,
+    pub alert_softnet_dropped_warn_per_tick: u64,
+    pub alert_softnet_dropped_crit_per_tick: u64,
+    pub alert_listen_overflows_warn_per_tick: u64,
+    pub alert_listen_overflows_crit_per_tick: u64,
+    pub alert_conntrack_util_warn_percent: u64,
+    pub alert_conntrack_util_crit_percent: u64,
+    pub alert_conntrack_insert_failed_warn_per_tick: u64,
+    pub alert_conntrack_insert_failed_crit_per_tick: u64,
+    pub alert_nic_rx_dropped_warn_per_tick: u64,
+    pub alert_nic_rx_dropped_crit_per_tick: u64,
     pub ss_enrich: bool,
     pub ss_netns: Option<String>,
     pub netem_confirm: bool,
+    /// 0 = refresh nft rule list every snapshot tick
+    pub nft_policy_rules_refresh_ms: u64,
+    /// 0 = rebuild inode→PID cache every snapshot tick when correlation is on
+    pub proc_inode_cache_refresh_ms: u64,
+    pub ss_autofill_min_interval_ms: u64,
     pub max_flow_rows: usize,
     pub proc_pid_correlation: bool,
+    pub policy_sim_medium_bytes: u64,
+    pub policy_sim_high_bytes: u64,
+    pub policy_sim_medium_uncertain_ratio: f64,
+    pub policy_sim_high_uncertain_ratio: f64,
 }
 
 pub fn effective(cli: &Cli, file: &Option<ConfigFile>) -> EffectiveConfig {
@@ -202,15 +296,66 @@ pub fn effective(cli: &Cli, file: &Option<ConfigFile>) -> EffectiveConfig {
         alert_top_pid_bytes: f
             .and_then(|x| x.alert_top_pid_bytes)
             .unwrap_or(cli.alert_top_pid_bytes),
+        alert_softnet_dropped_warn_per_tick: f
+            .and_then(|x| x.alert_softnet_dropped_warn_per_tick)
+            .unwrap_or(cli.alert_softnet_dropped_warn_per_tick),
+        alert_softnet_dropped_crit_per_tick: f
+            .and_then(|x| x.alert_softnet_dropped_crit_per_tick)
+            .unwrap_or(cli.alert_softnet_dropped_crit_per_tick),
+        alert_listen_overflows_warn_per_tick: f
+            .and_then(|x| x.alert_listen_overflows_warn_per_tick)
+            .unwrap_or(cli.alert_listen_overflows_warn_per_tick),
+        alert_listen_overflows_crit_per_tick: f
+            .and_then(|x| x.alert_listen_overflows_crit_per_tick)
+            .unwrap_or(cli.alert_listen_overflows_crit_per_tick),
+        alert_conntrack_util_warn_percent: f
+            .and_then(|x| x.alert_conntrack_util_warn_percent)
+            .unwrap_or(cli.alert_conntrack_util_warn_percent),
+        alert_conntrack_util_crit_percent: f
+            .and_then(|x| x.alert_conntrack_util_crit_percent)
+            .unwrap_or(cli.alert_conntrack_util_crit_percent),
+        alert_conntrack_insert_failed_warn_per_tick: f
+            .and_then(|x| x.alert_conntrack_insert_failed_warn_per_tick)
+            .unwrap_or(cli.alert_conntrack_insert_failed_warn_per_tick),
+        alert_conntrack_insert_failed_crit_per_tick: f
+            .and_then(|x| x.alert_conntrack_insert_failed_crit_per_tick)
+            .unwrap_or(cli.alert_conntrack_insert_failed_crit_per_tick),
+        alert_nic_rx_dropped_warn_per_tick: f
+            .and_then(|x| x.alert_nic_rx_dropped_warn_per_tick)
+            .unwrap_or(cli.alert_nic_rx_dropped_warn_per_tick),
+        alert_nic_rx_dropped_crit_per_tick: f
+            .and_then(|x| x.alert_nic_rx_dropped_crit_per_tick)
+            .unwrap_or(cli.alert_nic_rx_dropped_crit_per_tick),
         ss_enrich: f.and_then(|x| x.ss_enrich).unwrap_or(cli.ss_enrich),
         ss_netns: f
             .and_then(|x| x.ss_netns.clone())
             .or_else(|| cli.ss_netns.clone())
             .filter(|s| !s.is_empty()),
         netem_confirm: f.and_then(|x| x.netem_confirm).unwrap_or(cli.netem_confirm),
+        nft_policy_rules_refresh_ms: f
+            .and_then(|x| x.nft_policy_rules_refresh_ms)
+            .unwrap_or(cli.nft_policy_rules_refresh_ms),
+        proc_inode_cache_refresh_ms: f
+            .and_then(|x| x.proc_inode_cache_refresh_ms)
+            .unwrap_or(cli.proc_inode_cache_refresh_ms),
+        ss_autofill_min_interval_ms: f
+            .and_then(|x| x.ss_autofill_min_interval_ms)
+            .unwrap_or(cli.ss_autofill_min_interval_ms),
         max_flow_rows: f.and_then(|x| x.max_flow_rows).unwrap_or(cli.max_flow_rows),
         proc_pid_correlation: f
             .and_then(|x| x.proc_pid_correlation)
             .unwrap_or(cli.proc_pid_correlation),
+        policy_sim_medium_bytes: f
+            .and_then(|x| x.policy_sim_medium_bytes)
+            .unwrap_or(cli.policy_sim_medium_bytes),
+        policy_sim_high_bytes: f
+            .and_then(|x| x.policy_sim_high_bytes)
+            .unwrap_or(cli.policy_sim_high_bytes),
+        policy_sim_medium_uncertain_ratio: f
+            .and_then(|x| x.policy_sim_medium_uncertain_ratio)
+            .unwrap_or(cli.policy_sim_medium_uncertain_ratio),
+        policy_sim_high_uncertain_ratio: f
+            .and_then(|x| x.policy_sim_high_uncertain_ratio)
+            .unwrap_or(cli.policy_sim_high_uncertain_ratio),
     }
 }

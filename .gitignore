@@ -12,6 +12,10 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 
+# Web UI (Vite / npm)
+web/node_modules/
+web/dist/
+
 # OS files
 *.exe
 *.dll

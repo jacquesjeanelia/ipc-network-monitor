@@ -1,0 +1,35 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Network monitor",
+  "version": "0.1.0",
+  "identifier": "dev.ipcnetmon.netmon",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Network monitor",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 560,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png"]
+  }
+}

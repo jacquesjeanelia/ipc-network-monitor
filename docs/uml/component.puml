@@ -26,6 +26,7 @@ package "Userspace Privileged (kernel-spy)" {
 package "Userspace Unprivileged" {
   [collector] as collector
   [ui] as ui
+  [netmon-desktop] as netmon_desktop
   [ctl client] as ctl_client
 }
 
@@ -87,11 +88,14 @@ main_loop --> rpc_dispatch : async dispatch
 
 collector --> export_socket : read snapshots
 ui --> export_socket : read snapshots
+netmon_desktop --> export_socket : Tauri Rust reads snapshots
+netmon_desktop --> control_socket : Tauri Rust forwards RPC
 ctl_client --> control_socket : send RPC
 control_socket --> rpc_dispatch : dispatch
 
 collector --> common : parse_export_line()
 ui --> common : parse_export_line()
+netmon_desktop --> common : parse_export_line()
 
 audit_log --> audit_file : O_APPEND writes
 nft_backup --> state_dir : JSON backups

@@ -302,19 +302,19 @@ pub fn pid_via_proc_socket(meta: &PacketMetadata, cache: &InodePidCache) -> Opti
     cache.pid_for_inode(inode)
 }
 
-/// Look up pid+comm from the eBPF SOCK_SPORT_PID map by a candidate local port (try src_port and dst_port).
+/// Look up pid, comm, real uid, and real gid from the eBPF `SOCK_SPORT_PID` map (TCP local sport key).
 /// Falls back gracefully if the entry is absent.
 pub fn pid_comm_from_ebpf_map<T: std::borrow::Borrow<aya::maps::MapData>>(
     sport: u16,
     map: &aya::maps::HashMap<T, u16, kernel_spy_common::PidComm>,
-) -> Option<(u32, String)> {
+) -> Option<(u32, String, u32, u32)> {
     let entry = map.get(&sport, 0).ok()?;
     if entry.pid == 0 {
         return None;
     }
     let comm_end = entry.comm.iter().position(|&b| b == 0).unwrap_or(16);
     let comm = String::from_utf8_lossy(&entry.comm[..comm_end]).into_owned();
-    Some((entry.pid, comm))
+    Some((entry.pid, comm, entry.uid, entry.gid))
 }
 
 #[cfg(test)]
